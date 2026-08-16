@@ -17,6 +17,22 @@
 // metacharacters -- so the fallback lets cmd.exe do its own PATH+PATHEXT resolution (finding the
 // `.cmd` shim, exactly as a human typing the same command at a prompt would) without reintroducing
 // shell-injection risk through argument content.
+//
+// exitCode:null caveat on the fallback path (disclosed in Step 12's adversarial review, approved
+// commit e389620): PHASE_1_SPEC.md §6.1's contract that a spawn error resolves with
+// `exitCode: null` describes the non-Windows-fallback path. When the cmd.exe relaunch above
+// engages and the underlying command genuinely isn't found by cmd.exe's own PATH+PATHEXT
+// resolution either, the result comes from cmd.exe's own `close` event, not from a second spawn
+// error -- so `exitCode` is cmd.exe's real (non-null) exit code, observed on this machine as `1`.
+// That is the same code some legitimate business-logic outcomes already use elsewhere in this
+// codebase (e.g. `codex login status` returning `1` for "not logged in"), and there is no
+// reliable, locale-independent numeric signal to tell the two apart; parsing cmd.exe's own
+// (potentially localized) stderr text to disambiguate would be exactly the non-deterministic
+// heuristic the I2 invariant (PRD §7) forbids, so this file does not attempt it. This is a
+// documented, deliberate, narrower exception to §6.1 on Windows, not an oversight. Any caller
+// that needs a reliable "is this CLI even installed" signal on Windows must not rely on
+// `exitCode === null` specifically -- treat any non-zero exit code as the failure signal, which
+// every current caller already does.
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -84,7 +100,11 @@ function isEnoent(err: Error): boolean {
  * confuse "not installed" with a thrown bug.
  *
  * `allowWindowsCmdFallback` gates the one-time `cmd.exe` relaunch described at the top of this
- * file; it is only ever `false` on the relaunch attempt itself, preventing a retry loop.
+ * file; it is only ever `false` on the relaunch attempt itself, preventing a retry loop. Note
+ * that the `exitCode: null` guarantee above holds for the initial spawn's own error path, but not
+ * for a fallback relaunch that itself fails to find the command: see the "exitCode:null caveat"
+ * paragraph in the file-level comment for why that case surfaces a real, non-null exit code
+ * instead.
  */
 function spawnOnce(
   o: RunProcessOptions,
