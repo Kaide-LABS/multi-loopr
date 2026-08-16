@@ -11,8 +11,9 @@ import { dirname } from "node:path";
 import { ContinuityError } from "../domain/errors.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
 import { runProcess } from "../util/exec.ts";
-import { sha256String } from "../util/hash.ts";
+import { sha256File, sha256String } from "../util/hash.ts";
 import { CONTINUITY_CHECKS, verifyContinuation } from "./continuity.ts";
+import { commitsBetween, currentBranch, revParse } from "./git.ts";
 
 const GIT_TIMEOUT_MS = 30_000;
 
@@ -315,6 +316,62 @@ test("C3 passes vacuously when the prior turn changed no paths", async () => {
     const c3 = verdict.checks.find((c) => c.id === "C3_NO_REVERT");
     assert.equal(c3?.passed, true);
     assert.equal(c3?.evidence["reason"], "vacuous");
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+// Additional coverage for the other [DET] git.ts plumbing wrappers and the hash.ts file-hashing
+// primitive, which the continuity-verdict tests above exercise only indirectly (isAncestor,
+// changedPaths, blobOidAt).
+
+test("sha256File matches sha256String for the same bytes on disk", async () => {
+  const dir = await freshRepo();
+  try {
+    const content = "the quick brown fox\n";
+    const filePath = `${dir}/sample.txt`;
+    await writeFile(filePath, content, "utf8");
+    const fromFile = await sha256File(filePath);
+    assert.equal(fromFile, sha256String(content));
+    assert.match(fromFile, /^[0-9a-f]{64}$/);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("revParse resolves a ref to its full OID and throws on an unknown ref", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "hello\n" }, "initial");
+    const resolved = await revParse(dir, "HEAD");
+    assert.equal(resolved, commit0);
+    await assert.rejects(() => revParse(dir, "not-a-real-ref"));
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("currentBranch returns the branch name, and HEAD when detached", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "hello\n" }, "initial");
+    assert.equal(await currentBranch(dir), "main");
+    await git(dir, ["checkout", "--quiet", "--detach", commit0]);
+    assert.equal(await currentBranch(dir), "HEAD");
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("commitsBetween returns an oldest-first list, and an empty array for an empty range", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "v0\n" }, "commit 0");
+    const commit1 = await commitFiles(dir, { "foo.txt": "v1\n" }, "commit 1");
+    const commit2 = await commitFiles(dir, { "foo.txt": "v2\n" }, "commit 2");
+
+    assert.deepStrictEqual(await commitsBetween(dir, commit0, commit2), [commit1, commit2]);
+    assert.deepStrictEqual(await commitsBetween(dir, commit2, commit2), []);
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
