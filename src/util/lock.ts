@@ -4,6 +4,11 @@
 // a time (PRD §3 item 8); this primitive enforces that rather than assuming it. Acquisition uses
 // `fs.open(path, "wx")`, an atomic filesystem primitive -- an `existsSync` check followed by a
 // write would be a check-then-act race and is forbidden.
+//
+// Reclaiming a stale lock is the one operation here that can BREAK the invariant rather than
+// enforce it, so every reclaim decision is biased toward refusing: see `reclaimIfStaleOrThrow` and
+// `processLivenessVerdict` for why "the liveness probe failed" and "the lock was minted on another
+// host" are both treated as held, never as stale.
 
 import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -68,11 +73,31 @@ async function tryCreateLockFile(lockPath: string, info: LockInfo): Promise<"cre
 }
 
 /**
- * Inspects the existing lock at `lockPath` (already known to exist via a prior `EEXIST`). Throws
- * {@link LockHeldError} if its pid is alive; otherwise unlinks it (stale or corrupt) so the caller
- * can retry the create exactly once.
+ * Inspects the existing lock at `lockPath` (already known to exist via a prior `EEXIST`) and
+ * decides whether it may be reclaimed. Throws {@link LockHeldError} when the lock must be left
+ * alone; otherwise unlinks it (stale or corrupt) so the caller can retry the create exactly once.
+ *
+ * Reclaiming means unlinking a file another process may still be relying on, so the decision is
+ * deliberately asymmetric: it unlinks only on *positive* evidence that the holder is gone. Three
+ * distinct refusals, in order:
+ *
+ * 1. **Cross-host.** A pid is only meaningful on the machine that minted it. If `info.host` is not
+ *    this machine's `hostname()` -- which happens whenever `.multi-loopr` lives on a shared or
+ *    network filesystem -- there is nothing local to probe, and probing anyway would almost always
+ *    report "not found" and steal a lock held by a live process on the other host. Refuse without
+ *    probing, and name both hosts so an operator can actually diagnose it.
+ * 2. **Alive.** The usual case: the holder's pid answers the probe.
+ * 3. **Indeterminate.** The probe failed for a reason that is neither "no such process" nor
+ *    "exists but not yours" (see {@link processLivenessVerdict}). A failed probe is not evidence of
+ *    death, so it must never license a reclaim.
+ *
+ * `killFn` is a test seam only, threaded to {@link processLivenessVerdict}; it defaults to the real
+ * `process.kill`, so `acquireRunLock`'s call site -- which never passes it -- is byte-identical to
+ * before this parameter existed. Exported for the same reason: the indeterminate branch is
+ * unreachable from `acquireRunLock`'s fixed two-argument public signature, which this hardening
+ * fix is not permitted to change.
  */
-async function reclaimIfStaleOrThrow(lockPath: string): Promise<void> {
+export async function reclaimIfStaleOrThrow(lockPath: string, killFn: KillProbeFn = defaultKillProbe): Promise<void> {
   let raw: string;
   try {
     raw = await readFile(lockPath, "utf8");
@@ -90,11 +115,46 @@ async function reclaimIfStaleOrThrow(lockPath: string): Promise<void> {
   const parsed = parseLockInfo(raw);
   if (parsed === null) {
     process.stderr.write(`multi-loopr: lock file ${lockPath} is corrupt; treating as stale.\n`);
-  } else if (isProcessAlive(parsed.pid)) {
-    throw new LockHeldError(
-      `Run lock at ${lockPath} is held by pid ${parsed.pid} (acquired at ${parsed.acquiredAt}).`,
-      { holderPid: parsed.pid, acquiredAt: parsed.acquiredAt, lockPath },
-    );
+  } else {
+    const localHost = hostname();
+    if (parsed.host !== localHost) {
+      throw new LockHeldError(
+        `Run lock at ${lockPath} was acquired on host "${parsed.host}" by pid ${parsed.pid} ` +
+          `(acquired at ${parsed.acquiredAt}), but this machine is host "${localHost}". A pid from ` +
+          `another host cannot be checked from here, so the lock is treated as held rather than ` +
+          `reclaimed. If host "${parsed.host}" is genuinely gone, delete ${lockPath} by hand.`,
+        {
+          holderPid: parsed.pid,
+          holderHost: parsed.host,
+          localHost,
+          acquiredAt: parsed.acquiredAt,
+          lockPath,
+          reason: "cross-host",
+        },
+      );
+    }
+
+    const liveness = processLivenessVerdict(parsed.pid, killFn);
+    if (liveness === "alive") {
+      throw new LockHeldError(
+        `Run lock at ${lockPath} is held by pid ${parsed.pid} (acquired at ${parsed.acquiredAt}).`,
+        { holderPid: parsed.pid, acquiredAt: parsed.acquiredAt, lockPath, reason: "holder-alive" },
+      );
+    }
+    if (liveness === "indeterminate") {
+      throw new LockHeldError(
+        `Run lock at ${lockPath} is held by pid ${parsed.pid} (acquired at ${parsed.acquiredAt}) and ` +
+          `its liveness could not be determined -- the process probe failed for a reason other than ` +
+          `"no such process". Refusing to reclaim: a failed probe is not evidence the holder is gone. ` +
+          `If pid ${parsed.pid} is genuinely gone, delete ${lockPath} by hand.`,
+        {
+          holderPid: parsed.pid,
+          acquiredAt: parsed.acquiredAt,
+          lockPath,
+          reason: "liveness-indeterminate",
+        },
+      );
+    }
   }
 
   try {
@@ -187,18 +247,57 @@ export async function releaseRunLock(repoDir: string, runId: string): Promise<vo
 }
 
 /**
- * True iff a process with `pid` currently exists, using `process.kill(pid, 0)`'s
- * throws-or-not-and-error-code contract: no throw or `EPERM` (owned by another user) => alive;
- * `ESRCH` => dead.
+ * The three genuinely distinguishable outcomes of probing a pid. Note that `"indeterminate"` is
+ * not a fourth shade of `"dead"`: it means the probe itself failed, which says nothing at all
+ * about the process. Collapsing it into `"dead"` is what lets a lock be stolen from a live holder.
  */
-export function isProcessAlive(pid: number): boolean {
+export type ProcessLivenessVerdict = "alive" | "dead" | "indeterminate";
+
+/** The `process.kill(pid, 0)`-shaped probe {@link processLivenessVerdict} uses. Injectable for tests. */
+export type KillProbeFn = (pid: number, signal: 0) => void;
+
+const defaultKillProbe: KillProbeFn = (pid, signal) => {
+  process.kill(pid, signal);
+};
+
+/**
+ * Classifies `pid` using `process.kill(pid, 0)`'s throws-or-not-and-errno contract:
+ *
+ * - no throw, or `EPERM` (the process exists but belongs to another user) => `"alive"`;
+ * - `ESRCH`, the one documented "no such process" errno => `"dead"`;
+ * - anything else -- a different errno, or a throw that is not a Node errno object at all =>
+ *   `"indeterminate"`. The probe failed; that is a fact about the probe, not about the process.
+ *
+ * Only `"dead"` is positive evidence that a lock's holder is gone. {@link reclaimIfStaleOrThrow}
+ * relies on that: it reclaims on `"dead"` and refuses on the other two, reporting which of the two
+ * it hit. `killFn` is a test seam and defaults to the real `process.kill`.
+ */
+export function processLivenessVerdict(pid: number, killFn: KillProbeFn = defaultKillProbe): ProcessLivenessVerdict {
   try {
-    process.kill(pid, 0);
-    return true;
+    killFn(pid, 0);
+    return "alive";
   } catch (err) {
-    if (isNodeError(err) && err.code === "EPERM") {
-      return true;
+    if (!isNodeError(err)) {
+      return "indeterminate";
     }
-    return false;
+    if (err.code === "ESRCH") {
+      return "dead";
+    }
+    if (err.code === "EPERM") {
+      return "alive";
+    }
+    return "indeterminate";
   }
+}
+
+/**
+ * True iff a process with `pid` is not known to be gone. A thin fail-safe wrapper over
+ * {@link processLivenessVerdict}: only the definitive `"dead"` verdict returns `false`, so an
+ * indeterminate probe reads as `true` ("can't tell" must never be actioned as "gone"). The two
+ * verdicts this function already got right -- no throw or `EPERM` => `true`, `ESRCH` => `false` --
+ * are unchanged. Callers needing to know *why* a pid was treated as alive should call
+ * {@link processLivenessVerdict} directly.
+ */
+export function isProcessAlive(pid: number, killFn: KillProbeFn = defaultKillProbe): boolean {
+  return processLivenessVerdict(pid, killFn) !== "dead";
 }
