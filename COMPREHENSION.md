@@ -13,337 +13,390 @@ work, then hands the baton to the other, which is expected to genuinely continue
 redo it, ignore it, or quietly undo it.
 
 Phase 1 built the plumbing the race runs on. Phase 2 taught the tool how to speak each assistant's own
-language (the exact command-line words, the effort dial, the pass/fail reader) but never actually
-pressed the button.
+language. Phase 3 pressed the button for the first time: it made multi-loopr actually spawn the real
+assistant CLIs, run a fixed three-leg sequence (one assistant goes first, the other continues, a third
+leg reviews the combined result), and never simply believe what an assistant claims about its own
+work -- every self-reported git commit and file fingerprint gets thrown away and recomputed from the
+real repository before being trusted.
 
-This phase presses the button. multi-loopr can now actually run a race: given a small configuration
-file (which two assistants to use, which repository, which numbered project-phase document to work
-from, and how long to let a turn run before giving up on it), it dispatches a real, fixed three-leg
-sequence -- one assistant goes first, the other assistant continues that work, and then one of the two
-reviews the combined result -- and it does this for real: it spawns the actual assistant CLI, waits for
-it to finish or time out, and reads back whatever handoff note that assistant wrote to disk.
+This phase closes a gap Phase 3 deliberately left open. The whole reason multi-loopr exists is to run
+a specific, disciplined build method (called loopr) that starts every phase of work from a small set of
+its own planning documents: a one-time problem statement, a one-time background/context document, and
+a numbered phase-by-phase blueprint. Through Phase 3, multi-loopr handed an assistant the *location* of
+that phase's blueprint but had no way to make sure the assistant actually read the problem statement or
+the background document at all, and had no way to make sure the reviewing assistant, at the end of its
+turn, actually sat down and wrote the *next* phase's real blueprint rather than just saying it would.
 
-The most important new idea this phase introduces is that multi-loopr never simply believes what an
-assistant claims about its own work. Every assistant's turn ends with it writing a note that includes
-claims like "here is the git commit I made" or "here is the file I changed, and here is that file's
-fingerprint." This phase throws every one of those specific claims away and recomputes them itself,
-directly from the real git history and the real files on disk, before trusting the note for anything
-that matters. An assistant can still describe, in its own words, what it did and what's left to do --
-that part is trusted -- but never the parts a dishonest or simply mistaken assistant could fake to make
-its own turn look more successful than it was.
+This phase adds two new, purely mechanical checks. First: after every single turn (both assistants that
+do the building, and the one that reviews), multi-loopr checks that the turn's own handoff note lists
+the problem statement, the background document, and the phase blueprint as files it says it read. If any
+one of the three is missing from that list, the whole run stops immediately with a specific, named
+error -- there is no second chance for this particular failure. Second: at the end of the reviewing
+assistant's turn specifically, multi-loopr checks two things together -- that the assistant's handoff
+note claims it wrote the next phase's blueprint, *and* that the assistant's own real git commits from
+that turn actually touched that exact file. Claiming to have written it is not enough; a leftover file
+from some earlier, abandoned attempt that the assistant merely points at without touching does not
+count either. Only a file that is both claimed and genuinely, freshly committed this turn satisfies the
+check. On the very last phase of a target build, this same mechanism asks for a different, final
+"build complete" document instead of another phase blueprint.
 
-The second new idea is a safety net for the handoff itself: after each assistant's turn, multi-loopr
-runs the same strict, mechanical continuity check Phase 1 built (did the next turn actually build on the
-last one, or did it quietly ignore or undo it?). If that check fails once, multi-loopr gives the same
-assistant exactly one more try, explicitly telling it what went wrong -- but only ever one extra try,
-and only for that specific kind of failure. Any other kind of problem (a crash, a timeout, an assistant
-that honestly reports it got stuck) stops the whole run immediately, with no retry, because those are
-not situations where "try again" is an honest response.
+Neither of these two checks is graded for quality -- multi-loopr never reads or judges what the
+problem statement, background document, or blueprint actually say, and it never checks whether the
+newly written next-phase blueprint is any good. It checks only "was this genuinely touched," the same
+narrow, mechanical kind of question every other check in this tool asks. multi-loopr itself still never
+writes a single word of any of these documents; that remains entirely the dispatched assistant's own
+job, exactly as before.
 
-This phase still does not do any of the real work of the loopr method itself: it does not draft a real
-project-phase document, and it does not loop across phases on its own -- one invocation of the tool
-plays exactly one three-leg race and then stops, the same way this project's own operator manually
-re-runs its own review-and-comprehension steps between phases rather than letting them self-chain.
+There is an important, deliberately disclosed limit to how far this new check can see, and it is worth
+stating plainly rather than only in the more technical sections below: mechanically confirming that an
+assistant's handoff note names a real file, with a truthful fingerprint of that file's actual current
+content, is not the same thing as confirming the assistant's own reasoning genuinely drew on what is
+inside that file. An assistant is handed the file's location as part of its own instructions for the
+turn -- it has to be, or it would not know where to look -- and a shortcut-taking or simply careless
+assistant could, in principle, copy that same location straight into its own self-report without ever
+truly opening and absorbing the file. The check this phase adds can catch "never even claimed to have
+looked," but it structurally cannot catch "claimed to have looked, and named the real file, but never
+actually engaged with what was inside it." This is not something this phase got wrong -- the mechanism
+that makes the check possible at all was actually built back in Phase 1, and this phase's own reviewer
+noticed and disclosed the limit rather than missing it or quietly building past it. It is a
+genuine, standing limit of watching any AI assistant's work from the outside, not a bug to be patched
+away, and it is recorded again below (sections 5 and 6) rather than left as a one-time footnote.
 
-Also worth understanding in plain terms, because it happened again this phase in a slightly new shape:
-a reviewer signed off on this phase's code, and separately flagged -- explicitly, in writing, without
-fixing it -- one thing they had noticed but judged out of scope for their own pass: two of the newly
-written tests only avoided a real risk (accidentally starting a real assistant turn just by running the
-test suite) because of a coincidence of this one development machine's current login state, not because
-the code was actually built to prevent it. The operator directed a follow-up fix, done after the
-review's own approval, that closes this properly: it gives that specific piece of code a way to be
-handed fake stand-ins during a test, the same way every other part of this phase's code already could
-be, so the tests no longer depend on which assistant happens to be logged in on whichever machine runs
-them.
+One other thing happened again this phase in a familiar shape, worth a plain-language note the way a
+similar Phase 3 event was: the reviewer who signed off on this phase's code found one small, honest
+mismatch between what the plan said and what the finished code actually needed -- a couple of test
+files needed three extra lines each supplying data a newly-required field now demands, which is a
+routine, expected consequence of tightening a requirement, not a defect -- and said so plainly rather
+than letting the plan's wording stand next to code that behaves slightly differently.
 
 ## 2. Architecture walkthrough
 
-Every file below was read in full this run and exists in the repository at the stated path. Phases 1
-and 2's own architecture (unchanged this phase, so not re-described here) remain as `COMPREHENSION.md`'s
-own Phase 1/2 entries in the Phase Log below record them.
+Every file below was read in full this run and exists in the repository at the stated path. Phases 1-3's
+own architecture, where unchanged this phase, is not re-described here; it remains as `COMPREHENSION.md`'s
+own Phase 1/2/3 entries in the Phase Log below record it. This section covers `src/dispatch/` and its
+neighbours as they now stand after this phase's additions.
 
-**New this phase: `src/dispatch/`** -- the turn-sequencing and orchestration layer, the first new
-top-level `src/` directory since Phase 2's `src/adapters/`.
-- `src/dispatch/plan.ts` -- `otherProviderId(id)` (total over the two `PROVIDER_IDS`, throws
-  `InternalError` for an unreachable input) and `planTurnSequence(config)`, which resolves PRD §6.3's
-  DECISION into the fixed three-slot `TurnPlan[]`: executor on `executor_providers[0]`, executor on
-  `executor_providers[1]`, reviewer on `reviewer_provider ?? otherProviderId(executor_providers[1])`.
-- `src/dispatch/plan.test.ts` -- sequence correctness, the reviewer default vs. an explicit override,
-  `otherProviderId` totality and its defensive throw.
-- `src/dispatch/prompt.ts` -- `buildProtocolInstructions()`, `buildHandoffContext()`,
-  `buildExecutorPrompt()`, `buildReviewerPrompt()`. Assembles each dispatched turn's actual prompt text
-  from a role profile (Phase 1, unchanged) plus protocol instructions plus, where applicable, the prior
-  turn's allow-listed context and (for the reviewer only) the real git diff between the two executor
-  turns, capped at 20,000 characters with a `"truncated"` marker past the cap. No function in this file
-  reads `process.env`, spawns a process, or touches a clock.
-- `src/dispatch/prompt.test.ts` -- the six mandatory protocol-instruction items tested individually by
-  substring; the allow-list boundary (`buildHandoffContext` proven not to leak `schema_version`,
-  `run_id`, or `model_tier`); diff truncation; retry-note appending.
-- `src/dispatch/record.ts` -- `captureGroundTruthBefore(repoDir)` and
-  `reconcileHandoffRecord(repoDir, draft, ground)`. The latter unconditionally replaces the
-  agent-authored `repo`, `spec_ref`, and every `artifacts_read`/`artifacts_written` entry's `sha256`
-  with independently-computed ground truth (a dropped, non-fatal outcome for a declared path that does
-  not exist on disk), then re-runs `HandoffRecord.safeParse` on the reconciled object, throwing
-  `RelaySchemaError` on a reconciliation-triggered failure distinct from a raw schema defect.
-- `src/dispatch/record.test.ts` -- reconciliation exercised against real temporary git repositories; a
-  deliberately wrong agent-authored `repo`/`spec_ref`/artifact hash is proven overwritten.
-- `src/dispatch/turn.ts` -- `runTurn(req, deps)`. One turn end to end, in a fixed order: capture ground
-  truth, build the invocation via the adapter, merge the environment as
-  `{ ...process.env-with-undefined-dropped, ...invocation.env }` (never `invocation.env` alone), spawn
-  via an injectable `runProcessFn` (defaults to the real `runProcess`), interpret the result, read the
-  on-disk `HandoffRecord` (a `RelaySchemaError`/`IsolationLeakError` here becomes a modelled failure, not
-  a throw), reconcile it against ground truth, assert commit neutrality on the real commit list when any
-  exist, then persist the reconciled record at the same path, overwriting the agent's own draft.
-- `src/dispatch/turn.test.ts` -- full turn lifecycle against a real temporary git repo, with an
-  injectable `runProcessFn` fixture; dedicated tests for the adapter-failure short-circuit, the
-  malformed-record and isolation-leak modelled-failure conversions, the reconciliation-rejection case,
-  the uncaught `BoundaryViolationError` propagation, the environment-merge contract, and timeout
-  pass-through.
-- `src/dispatch/run-loop.ts` -- `runDispatch(config, deps?)`, the top-level orchestrator: an extended
-  preflight (Phase 1's `runPreflight()` plus a `spec_path`-readability check, folded into one
-  `PREFLIGHT_FAILED` outcome), the run lock acquired before any turn and released in a `finally` wrapping
-  the entire turn loop, then the fixed three-slot loop with the bounded, exactly-one, non-`CONTINUED`
-  -verdict-only retry. `RunDispatchDeps` carries `adapters`, `runProcessFn`, and (an autonomous-critique
-  addition beyond the spec's literal two-field interface, explained in §3 below) `preflightFn`, all
-  optional and each defaulting to the real production dependency when omitted.
-- `src/dispatch/run-loop.test.ts` -- end-to-end dispatch scenarios against real temporary git repos with
-  an injected fake `AdapterRegistry`/`runProcessFn`/`preflightFn`: a clean 3-turn run; a continuity
-  failure that retries once and succeeds; a continuity failure on both the original and the retry
-  (`CONTINUITY_FAILED`, exit 6); a `"halted"` record stopping the run immediately (`RUN_HALTED`, exit
-  11); an adapter-reported failure with zero retry; an unexpected `BoundaryViolationError` throw that
-  still releases the lock; lock contention (`LOCK_HELD`, exit 8); a missing `spec_path` failing
-  preflight before the lock is ever touched.
+**New this phase: `src/dispatch/artifacts.ts`** -- the reference-attestation and real-production
+guards, the first new file added to `src/dispatch/` since Phase 3.
+- `nextPhaseSpecPath(specPath, phase, isFinalPhase)` -- pure path computation. Returns the literal
+  `"BUILD_COMPLETE.md"` when `isFinalPhase`; otherwise returns `` `${dir}PHASE_${phase + 1}_SPEC.md` ``,
+  where `dir` is `specPath`'s own directory prefix (everything through its last `/`, or `""`).
+  Confirmed by direct read: it never regex-parses `specPath`'s own filename for a phase number --
+  `phase + 1` is computed from the numeric `phase` argument directly.
+- `assertLooprArtifactsReferenced(record, expected)` -- checks that `record.artifacts_read` contains an
+  entry whose `path` equals each of `expected.babyPrdPath`, `expected.contextPath`, and
+  `expected.specPath`. Throws `LooprArtifactBypassError` naming every missing path (not only the first)
+  when any is absent; a no-op returning normally when all three are present. Confirmed by direct read:
+  it takes only expected *paths*, never expected hashes -- the function signature itself has no hash
+  parameter.
+- `assertNextPhaseSpecProduced(repoDir, record, expectedPath)` -- an async, two-part check run only for
+  the reviewer turn: (1) `record.artifacts_written` contains an entry with `path === expectedPath`; (2)
+  `changedPaths(repoDir, record.repo.head_before, record.repo.head_after)` (Phase 1's `src/verify/git.ts`,
+  confirmed unmodified this phase) includes `expectedPath`. Either part failing throws
+  `LooprArtifactBypassError` with a distinguishing `details.reason` (`"never_declared"` vs.
+  `"declared_but_not_touched"`), confirmed by reading both throw sites directly.
+- `src/dispatch/artifacts.test.ts` -- path-computation cases (root-level, nested-directory, final-phase
+  override); `assertLooprArtifactsReferenced` passing and failing (zero/one/two of three paths present,
+  confirming the missing-path list narrows correctly each time); `assertNextPhaseSpecProduced` exercised
+  against three real temporary git repositories (pass; never-declared; declared-but-untouched-by-commits,
+  the last one built by pre-committing a stale `PHASE_2_SPEC.md` before the turn's own commit range
+  starts, then confirming the guard still rejects it). No test in this file spawns a real `claude` or
+  `codex` process -- confirmed by reading the file's own `runProcess` usage, which only ever shells out
+  to `git`.
 
-**New this phase: `src/cli/run.ts`** -- `RunReport` (`z.strictObject`, mirroring `DoctorReport`'s shape)
-and `runRunCommand(opts, deps?)`: reads and validates the `--config` JSON file against `RunConfig`
-(a failure here is `UsageError`, exit 2, deliberately distinct from `RELAY_SCHEMA_INVALID`'s exit 4,
-which is reserved for the inter-agent `HandoffRecord` payload specifically), calls `runDispatch()`, and
-assembles the report. `deps` (added post-approval, see §3/§5) threads straight through to `runDispatch`'s
-own second argument and is `undefined` by default, so `src/cli/main.ts`'s real call site -- which never
-passes it -- is byte-identical to before the parameter existed.
-- `src/cli/run.test.ts` -- CLI-level config-file validation errors, `--json` output shape, exit-code
-  passthrough, `RunConfig`'s two new fields each rejecting an invalid value. As of the post-approval fix
-  (§3/§5), the direct `runRunCommand` "dispatches a valid config" test drives a full injected fake
-  `RunDispatchDeps` (a synthetic always-healthy preflight, a `RecordingFakeAdapter` pair, and a scripted
-  `runProcessFn` that writes real commits and real `HandoffRecord` files into a temp repo) through a
-  clean 3-turn run, and the real-subprocess `--json` CLI test uses a `spec_path` that can never resolve
-  to a readable file, so it deterministically fails preflight before the turn loop, on any machine, in
-  any provider-auth state.
+**Modified this phase (all confirmed additive by reading the diff directly, `git diff a5a4567..6fd4c8a`):**
+- `src/domain/run.ts` -- `RunConfig` gains three fields appended after `spec_path`: `baby_prd_path` and
+  `context_path` (both required, validated against the same `RepoRelPathLike` schema `spec_path` already
+  uses) and `is_final_phase: z.boolean().default(false)`. `TurnRequest` (plain interface) gains
+  `babyPrdPath: string`, `contextPath: string`, and `expectedArtifactPath: string | null`, appended after
+  `timeoutMs`.
+- `src/domain/errors.ts` -- gains `ExitCode.LOOPR_ARTIFACT_BYPASSED = 12` (appended after the existing
+  eleven, none renumbered -- confirmed by reading the diff hunk directly) and
+  `class LooprArtifactBypassError extends MultiLooprError`, one error class covering both new guards'
+  failures.
+- `src/dispatch/prompt.ts` -- `ProtocolInstructionParams` gains `babyPrdRepoRelPath`/
+  `contextRepoRelPath`; `buildProtocolInstructions()` gains two new mandatory-content items (instructing
+  the agent to read `baby_prd.md`/`context.md` and record each in `artifacts_read`), confirmed present as
+  literal substrings in the rendered output. A new exported function,
+  `buildArtifactProductionInstructions(expectedArtifactPath, isFinalPhase)`, is concatenated into
+  `buildReviewerPrompt()`'s output only, immediately after the protocol instructions and before the
+  handoff/diff context -- confirmed by reading `buildReviewerPrompt()`'s own `parts` array construction
+  directly; `buildExecutorPrompt()`'s own `parts` array never references this function.
+- `src/dispatch/turn.ts` -- `runTurn()` gains two new steps between the existing `reconcileHandoffRecord()`
+  call and `assertNeutralCommits()`: `assertLooprArtifactsReferenced(reconciled, {...})`, called
+  unconditionally for every turn, then `assertNextPhaseSpecProduced(req.repoDir, reconciled,
+  req.expectedArtifactPath)` inside `if (req.expectedArtifactPath !== null)`, a no-op for every executor
+  turn. Neither new call is wrapped in a try/catch -- confirmed by reading the surrounding code -- so
+  either guard's `LooprArtifactBypassError` propagates uncaught, exactly like `assertNeutralCommits()`'s
+  own existing `BoundaryViolationError` one step later. Both new steps run, and must pass, before
+  `writeHandoffRecord()` is ever called.
+- `src/dispatch/run-loop.ts` -- `runExtendedPreflight()` gains two more readability checks
+  (`baby_prd_path`, `context_path`) in the same loop shape as the existing `spec_path` check, folded into
+  the same `PREFLIGHT_FAILED` outcome. `runTurnLoop()` computes `nextArtifactPath =
+  nextPhaseSpecPath(config.spec_path, config.phase, config.is_final_phase)` once, alongside its existing
+  once-computed `specRef`, and threads `config.baby_prd_path`/`config.context_path`/`nextArtifactPath`
+  into every constructed `TurnRequest` and into `buildPromptForSlot()`'s prompt-building calls (the
+  reviewer branch additionally receives `expectedArtifactPath`/`isFinalPhase`). Confirmed by reading the
+  full diff: no new branch is added to the turn loop's own control flow (planning, lock, retry bound,
+  halt propagation) -- every addition is a value computed once and threaded through already-existing
+  parameter paths.
+- `src/adapters/claude-code.test.ts`, `src/adapters/codex-cli.test.ts` -- each gains exactly three lines
+  to their shared `makeTurnRequest()` fixture helper (`babyPrdPath`, `contextPath`,
+  `expectedArtifactPath: null`), supplying `TurnRequest`'s three newly-required fields. Confirmed by
+  reading the diff directly: the production adapter files themselves (`claude-code.ts`, `codex-cli.ts`)
+  are untouched.
+- `src/cli/run.test.ts` -- gains `RunConfig` fixture fields (`baby_prd_path`, `context_path`) and new
+  test cases for the two extended-preflight checks and `is_final_phase` schema behaviour.
+- `README.md` -- gains one sentence noting `run` now mechanically enforces genuine loopr-artifact
+  reference and production.
 
-**Modified this phase (all confirmed additive by reading the diff directly):**
-- `src/domain/run.ts` -- `RunConfig` gains two new required fields: `phase: z.number().int().min(1)` and
-  `spec_path`, validated against a locally-declared `RepoRelPathLike` schema (not imported from
-  `src/domain/relay.ts`'s `RepoRelPath`, to avoid creating an ES-module import cycle between the two
-  files -- `run.ts`'s own header comment states this constraint explicitly) built from the same
-  underlying `isSafeRepoRelPath` (`src/util/paths.ts`) both files already share.
-- `src/domain/errors.ts` -- gains `ExitCode.RUN_HALTED = 11` (appended after the existing ten, none
-  renumbered) and `class RunHaltedError extends MultiLooprError`.
-- `src/util/paths.ts` -- gains `repoRelToAbs(repoDir, repoRelPath)`, plain string concatenation
-  (deliberately not `node:path.join`/`resolve`), safe because its input has always already passed
-  `isSafeRepoRelPath`.
-- `src/verify/git.ts` -- gains `diffText(repoDir, fromOid, toOid)`: `git diff <fromOid>..<toOid>`, the
-  full unified diff body (unlike the existing `changedPaths`, which returns only names), following the
-  file's existing non-zero-exit-throws-`InternalError` wrapper convention.
-- `src/cli/main.ts` -- gains recognition of a `run` command (`--config <path>`, `--json`) inside
-  `parseArgs` (a new `parseRunArgs` function) and a new `case "run"` branch in `main()`'s dispatch
-  switch, plus `renderRunHumanReport()`. Every existing command's parsing and behaviour is unchanged --
-  the diff only adds new branches, touching no existing one.
-- `README.md` -- gains exactly one new sentence noting the `run` command exists.
-
-No other file changed this phase: `src/adapters/**`, `src/verify/preflight.ts`,
-`src/verify/continuity.ts`, `src/verify/boundary.ts`, `src/verify/boundary-rules.ts`,
-`src/verify/commits.ts`, `src/domain/relay.ts`, `src/domain/tiers.ts`, `src/domain/roles.ts`,
-`src/ports/provider-adapter.ts`, `src/util/exec.ts`, `src/util/hash.ts`, `src/util/lock.ts`, and
-`src/cli/doctor.ts` are byte-identical to the Phase 2 tip (confirmed: `git diff` between the two
-approval commits touches no path under any of those).
+No other file changed this phase: `src/adapters/claude-code.ts`, `src/adapters/codex-cli.ts`,
+`src/verify/**` (including `continuity.ts` and its `CONTINUITY_CHECKS` tuple), `src/domain/relay.ts` (the
+`HandoffRecord` schema itself -- no field added, no schema-version bump; both new guards operate entirely
+on the existing `artifacts_read`/`artifacts_written` `FileRef` arrays Phase 1 already shipped),
+`src/domain/tiers.ts`, `src/domain/roles.ts`, `src/ports/provider-adapter.ts`, `src/util/exec.ts`,
+`src/util/hash.ts`, `src/util/lock.ts`, `src/util/paths.ts`, `src/dispatch/plan.ts`,
+`src/dispatch/record.ts`, `src/cli/main.ts`, and `src/cli/doctor.ts` are byte-identical to the Phase 3
+tip -- confirmed this run: `git diff a5a4567..6fd4c8a -- src/verify/` produces no output at all.
 
 Verified this run by direct execution, not merely by reading source: `npm run typecheck` exits `0` with
-zero diagnostics; `npm run check` (typecheck + full test suite + boundary scan) exits `0`, reporting 196
-passing tests and 27 files scanned with 0 boundary violations; `node --test src/cli/run.test.ts` run in
-isolation shows all 10 of that file's tests passing, including the two tests the post-approval fix
-commit rewrote.
+zero diagnostics; `npm run check` (typecheck + full test suite + boundary scan) exits `0`, reporting 220
+passing tests and 28 files scanned with 0 boundary violations (both figures matching the approval commit
+`6fd4c8a`'s own stated verification exactly); `node src/cli/main.ts doctor --boundary` exits `0` with the
+same 28-file, 0-violation result run standalone.
 
 ## 3. Decisions and tradeoffs
 
-**Ground-truth reconciliation replaces the agent's self-reported `repo`/`spec_ref`/artifact hashes
-outright, rather than comparing and rejecting on mismatch.** `PHASE_3_SPEC.md` §6.3 states the
-alternative considered and rejected explicitly: a "compare and reject" design would require the agent's
-own prompt instructions to get git plumbing and hashing exactly right merely to avoid a spurious
-rejection, adding fragility for no security benefit, since ground truth is always independently
-available and cheap to compute. The tradeoff taken: the agent's own claims about these specific fields
-are never even consulted for correctness, only discarded -- the agent is told this up front in its own
-protocol instructions (`buildProtocolInstructions`'s "advisory only... overwrites" clause, confirmed
-present in `prompt.ts` and tested in `prompt.test.ts`), so this is a disclosed constraint on the agent,
-not a silent one.
+**One error class, `LooprArtifactBypassError`, covers two mechanically distinct guards.**
+`assertLooprArtifactsReferenced()` and `assertNextPhaseSpecProduced()` check different things (every
+turn's reference behaviour vs. only the reviewer's production behaviour) but both throw the same error
+class, confirmed by reading `src/domain/errors.ts` and both throw sites in `artifacts.ts` directly. The
+tradeoff: a caller catching `LooprArtifactBypassError` cannot distinguish which guard fired without
+reading `error.details`, but this is the same reasoning already applied to `BoundaryViolationError`
+covering six distinct boundary-rule violations (B1-B6, B8) under one exit code -- one exit code per
+*kind* of failure under a PRD acceptance criterion, not one per mechanical check, with the distinguishing
+detail carried in the message/details rather than the exit code.
 
-**Reconciliation can make a record fail validation even though the agent's own draft parsed cleanly.**
-`reconcileHandoffRecord` re-runs `HandoffRecord.safeParse` on the reconciled object as its final step
-(`src/dispatch/record.ts` lines 93-101) -- an agent claiming `status: "completed"` with zero real commits
-now fails schema refinement R3 even though its own draft, before reconciliation, would have parsed. The
-tradeoff: an honest agent that is merely bad at git bookkeeping is treated identically to a dishonest
-one, by design -- multi-loopr does not attempt to distinguish "the agent lied" from "the agent's
-plumbing was wrong," because I2 forbids trusting the agent's self-report for exactly the fields being
-checked either way.
+**Both new guards run inside `runTurn()`, as uncaught throws, not as a `RunDispatchDeps`-level return
+value -- the same shape `assertNeutralCommits()` already uses, deliberately not `run-loop.ts`'s own
+"return the exit code, never throw" shape.** Confirmed by reading `turn.ts` directly: neither
+`assertLooprArtifactsReferenced()` nor the `assertNextPhaseSpecProduced()` call is wrapped in a
+try/catch at its call site, so a thrown `LooprArtifactBypassError` propagates out of `runTurn()`,
+through `runDispatch()`, to `src/cli/run.ts`/`main.ts`'s existing generic catch -- exactly Phase 3's
+`BoundaryViolationError` precedent, not a new propagation pattern. The tradeoff, named explicitly in
+`run-loop.ts`'s own updated header comment (confirmed present): this is also why `RunHaltedError`
+remains unconstructed after this phase (§5/§6 below) -- Phase 4's new failure mode gave a real
+opportunity to either construct `RunHaltedError` for real or follow the opposite established pattern,
+and the shipped code follows the opposite pattern on purpose, not by default.
 
-**Retries are bounded to exactly one, and scoped to exactly one failure class: a non-`CONTINUED`
-continuity verdict.** Every other failure path in `run-loop.ts` (an adapter-reported process failure or
-timeout, a `RelaySchemaError`/`IsolationLeakError` from record read or reconciliation, a
-`LockHeldError`, a `PreflightError`, a `BoundaryViolationError` from `assertNeutralCommits`) returns or
-propagates on first occurrence with zero retry, verified by reading `run-loop.ts` directly: there is
-exactly one retry code path (the `verdict.verdict !== "CONTINUED"` branch), no loop construct anywhere
-in the file, and dedicated tests in both `run-loop.test.ts` and `turn.test.ts` confirm each of the other
-failure classes retries zero times. The tradeoff, stated in `PHASE_3_SPEC.md` §9 item 13: this bound is
-hardcoded, not an operator-tunable setting, deliberately -- an unbounded or configurable retry count was
-explicitly ruled out of scope.
+**Real production is checked as existence-in-`artifacts_written` AND real-commit-provenance, not
+existence alone.** `assertNextPhaseSpecProduced()`'s two-part design (confirmed by reading `artifacts.ts`
+directly: part 1 checks `artifacts_written` membership, part 2 independently calls `changedPaths()`
+against the turn's own `head_before`/`head_after`) means a reviewer cannot satisfy the guard merely by
+re-declaring a stale, pre-existing file it never touched -- verified directly against a real temporary
+git repo in `artifacts.test.ts`'s third `assertNextPhaseSpecProduced` test, which pre-commits a stale
+`PHASE_2_SPEC.md` before the turn's own commit range begins and confirms the guard still rejects it. The
+tradeoff: this is strictly a provenance check, not a content check (§4/§9 below) -- a reviewer that
+deletes a real prior file's content and replaces it with one trivial line, then commits it, still passes;
+multi-loopr's own guard cannot and does not judge substance, only "was this genuinely this turn's own
+commit."
 
-**`RunDispatchDeps` gained a third field, `preflightFn`, beyond what `PHASE_3_SPEC.md` §6.5 literally
-specified (`adapters`, `runProcessFn` only) -- a real, disclosed autonomous-critique addition, not a
-silent deviation.** `run-loop.ts`'s own doc comment on `RunDispatchDeps` states the reasoning directly:
-`runPreflight()` (Phase 1, unchanged) always shells out to the real `claude`/`codex` binaries with no
-injection seam of its own, so without `preflightFn` it would be structurally impossible for any test to
-reach `runDispatch`'s own turn-loop logic (lock, planning, continuity retry, halt) without both provider
-CLIs being genuinely installed and authenticated on the test-running machine -- directly contradicting
-§8 acceptance criterion #30's explicit requirement that no test in this phase spawn a real provider
-process. The tradeoff: `runDispatch`'s actual shipped signature is not byte-identical to the spec's
-literal §6.5 interface text, but production behaviour is unaffected (`preflightFn` defaults to the real
-`runPreflight`, and `src/cli/run.ts`'s own call site never passed a `deps` object at all prior to the
-post-approval fix below) -- this is exactly the kind of legitimate, disclosed spec deviation
-`PHASE_3_SPEC.md` §0's own standing constraint anticipates ("HALT and escalate... do not silently
-substitute a plausible-looking alternative"), and the reviewer's approval commit confirms it reviewed
-and accepted this addition rather than missing it.
+**`nextPhaseSpecPath()` derives the next phase number from `RunConfig.phase` (an integer the operator
+supplies), never by parsing digits out of `spec_path`'s own filename string.** Confirmed by reading the
+function directly: there is no regex or filename-parsing logic in `artifacts.ts` at all. The tradeoff,
+stated in the function's own doc comment and confirmed accurate: an operator-chosen `spec_path` is not
+guaranteed to embed a parseable phase number (e.g. a differently-named file), so deriving from the
+config's own authoritative `phase` field is more robust, at the cost of requiring the operator to keep
+`phase` and `spec_path` in sync themselves -- multi-loopr does not cross-check that `spec_path`'s
+filename actually matches `phase`'s value.
 
-**`runRunCommand` gained an injectable `deps?: RunDispatchDeps` parameter after Phase 3's own approval,
-not before -- a disclosed, architect-directed post-approval fix, not a unilateral change.** The review
-that approved Phase 3 (`a5a4567`) explicitly named, as a non-blocking finding it chose not to fix itself,
-that two of `src/cli/run.test.ts`'s tests exercised a real, un-injected `runDispatch(config)` call and
-were only safe because this specific development machine's Codex CLI happens to be unauthenticated --
-on a fully authenticated machine, the same tests could have dispatched a real provider-CLI turn as a
-side effect of running `npm test`. Commit `4588f9e` closes this by adding the same kind of injection
-seam `runDispatch` itself already had, threaded one layer up. I independently read this commit's actual
-diff (not the commit message alone) and confirm: it touches exactly two files (`src/cli/run.ts`,
-15 lines changed; `src/cli/run.test.ts`, 193 lines changed, no other file); `runRunCommand`'s new second
-parameter is optional and defaults to `undefined`, so `src/cli/main.ts`'s real call site -- itself
-untouched by this commit -- passes no `deps` argument and reaches `runDispatch(config, undefined)`,
-byte-identical production behaviour to before the parameter existed; the previously-hazardous test now
-drives a full injected `RunDispatchDeps` (a synthetic always-healthy preflight, a fake
-`AdapterRegistry`, and a scripted `runProcessFn` that writes real commits and real `HandoffRecord` files
-into a temp repo) through a genuine clean 3-turn run, asserting on the exact turn-by-turn status/verdict
-sequence rather than merely on a preflight-failure passthrough; the one CLI-level test that spawns a
-real `node src/cli/main.ts run` subprocess correctly cannot accept an injected `deps` (main.ts's own call
-site intentionally never threads one), so it instead uses a `spec_path` that can never resolve to a
-readable file, forcing a deterministic `PREFLIGHT_FAILED` before the turn loop is ever reached,
-regardless of machine or provider-auth state. I ran `npm run check` and `node --test src/cli/run.test.ts`
-myself at the current tip: 196/196 tests pass overall, and all 10 tests in `run.test.ts` pass in
-isolation, including the two rewritten by this commit. The tradeoff: none of substance -- this closes an
-UNCERTAIN item the reviewer explicitly declined to resolve unilaterally (correctly, since adding an
-injection seam to a spec-mandated function signature is a design decision, not a QA patch) by having the
-architect make the call instead, exactly the escalation path `PHASE_3_SPEC.md` §0 describes.
+**`is_final_phase` is operator-supplied per run, with no attempt by multi-loopr to infer, count, or
+detect it.** Confirmed by reading `src/domain/run.ts`: `is_final_phase: z.boolean().default(false)` is
+the entire mechanism -- no code anywhere in the diff counts phase-spec files on disk or reads any other
+run's history to guess this value. The tradeoff, stated explicitly in `PHASE_4_SPEC.md` §9 item 5 and
+confirmed as what shipped: an operator who forgets to set `is_final_phase: true` on a build's actual
+final phase gets a run that computes and enforces a `PHASE_(N+1)_SPEC.md` path that was never meant to
+exist, rather than the intended `BUILD_COMPLETE.md` -- a real operator-error surface this phase
+knowingly leaves unmitigated rather than building inference logic for a one-run-at-a-time tool.
+
+**Ground-truth reconciliation (Phase 3, unmodified) is the load-bearing mechanism the new guards build
+on, and this phase's own honesty-audit finding traces directly to what reconciliation does and does not
+prove -- see §5 below for the full account.** `reconcileHandoffRecord()` (`src/dispatch/record.ts`,
+confirmed byte-identical to Phase 3, re-read in full this run) recomputes every surviving
+`artifacts_read`/`artifacts_written` entry's SHA-256 from the real file on disk and silently drops any
+entry whose declared path does not resolve to a real file. `assertLooprArtifactsReferenced()` then only
+checks path membership in that already-reconciled list. The tradeoff this composition carries forward,
+not introduced by this phase: proving a path is real and its hash is truthful is not the same claim as
+proving the path was genuinely read for content, and Phase 4 does not close that specific gap -- see §5.
+
+**Retries remain bounded to exactly one, and remain scoped to exactly one failure class -- a
+non-`CONTINUED` continuity verdict -- unchanged from Phase 3.** `LooprArtifactBypassError` joins the same
+zero-retry bucket as `BoundaryViolationError`, `PreflightError`, `LockHeldError`,
+`RelaySchemaError`/`IsolationLeakError`, and `TurnTimeoutError`, confirmed by reading `run-loop.ts`
+directly: there is still exactly one retry code path in the file (unchanged from Phase 3), and this
+phase adds no second one for its own new error class. The tradeoff is the same one Phase 3's own
+comprehension pass already recorded: this bound is hardcoded, not operator-tunable, deliberately.
 
 ## 4. Domain mechanics
 
-**The three-slot turn sequence's provider assignment is a mechanical, non-arbitrary reading of PRD
-§6.3's DECISION, not a new domain figure.** `planTurnSequence` resolves "the reviewer runs on whichever
-provider did not produce the diff under review" (PRD §6.3, read directly this run) into
-`otherProviderId(executor_providers[1])` -- necessarily `executor_providers[0]` in multi-loopr's fixed
-two-provider system -- confirmed identical in both the spec's prose and the shipped `plan.ts` code.
-This is architecture, not a domain figure requiring a citation in this section's sense (a threshold,
-statistic, or methodology number) -- no such figure appears in `plan.ts`.
+**The final-phase artifact name, the literal string `"BUILD_COMPLETE.md"`, is not an arbitrary or
+externally-sourced figure -- it is this same meta-project's own existing convention, read directly.**
+`nextPhaseSpecPath()`'s doc comment states it is "the same final-phase artifact name this project's own
+loopr method already uses for itself." I confirmed this by checking the repo root: no `BUILD_COMPLETE.md`
+exists yet in this repo (multi-loopr's own build is only through Phase 4 of 5), so this is not a file I
+could verify against an existing instance in *this* repo specifically -- it is `PHASE_4_SPEC.md` §6.1's
+own stated convention, adopted as the general default for any target build multi-loopr drives, not a
+domain figure requiring an external citation in this section's sense (a threshold, statistic, or
+methodology number sourced from outside the project). Named here rather than silently passed over,
+since a reader could otherwise assume it was independently sourced.
 
-**The reviewer-diff truncation cap, `DIFF_CAP_CHARS = 20_000` in `src/dispatch/prompt.ts`.** This is an
-ordinary defensive-programming bound analogous to Phase 2's `MAX_REPORTED_EVENTS = 20`
-(`src/adapters/codex-cli.ts`) and Phase 1's SIGTERM-grace-period/recursion-depth constants, all
-previously treated in this project's own comprehension passes as engineering judgment calls rather than
-domain-derived figures requiring external citation -- consistent treatment continued here.
+**Which three artifacts count as "loopr's own canonical artifacts" (`baby_prd.md`, `context.md`, the
+phase spec) is a naming convention inherited from this project's own loopr method, not a new domain
+figure this phase invents.** Confirmed by reading `PHASE_4_SPEC.md` §0 and the PRD's own §1 problem
+statement, which both name these same three artifact types as loopr's existing vocabulary (this repo's
+own `.claude/loopr/baby_prd.md` and `.claude/loopr/context.md`, confirmed present on disk at those exact
+paths, are the running example). This is architecture/convention, not a threshold or statistic.
 
 No domain figures (thresholds, statistics, or methodology numbers sourced from an external authority)
-were introduced this phase. Phase 3's genuinely new content is internal orchestration design (turn
-sequencing, retry policy, ground-truth reconciliation), which `PHASE_3_SPEC.md` §0 itself explicitly
-distinguishes from "external CLI-surface risk" and marks `[DECISION, Phase 3]` throughout rather than
-`[VERIFIED-LOCAL]`/`[VERIFIED-DOC]` -- these are multi-loopr's own considered design choices, not vendor
-facts requiring a citation or an [UNVERIFIED] marker in the sense this section tracks.
+were introduced this phase, continuing the consistent treatment Phase 3's comprehension pass already
+established for this project's own internal orchestration design. `PHASE_4_SPEC.md` §0 itself states
+Phase 4 "introduces no new external CLI-surface risk at all... every genuinely new decision in this spec
+is internal design," marked `[DECISION, Phase 4]` throughout rather than `[VERIFIED-LOCAL]`/
+`[VERIFIED-DOC]` -- confirmed accurate by reading every `[DET, DECISION Phase 4]`-tagged function in
+`artifacts.ts` directly: none of the two new guards' logic depends on a vendor-sourced number, only on
+path-string comparison and git-commit membership.
 
 ## 5. Honesty audit
 
-Compared every `PHASE_3_SPEC.md` clause I read against the shipped code, this run, including running
-`npm run typecheck`, the full test suite via `npm run check`, and `node --test src/cli/run.test.ts` in
-isolation myself, rather than trusting the spec's or either review's own claims about their results.
+Compared every `PHASE_4_SPEC.md` clause I read against the shipped code, this run, including running
+`npm run typecheck`, the full test suite via `npm run check`, and `node src/cli/main.ts doctor --boundary`
+myself, rather than trusting the spec's or the review's own claims about their results. Both figures
+(220/220 tests, 28 files/0 boundary violations) matched the Phase 4 approval commit's own stated numbers
+exactly.
 
-**Real gap #1, disclosed by the phase's own review and now independently confirmed resolved by me: the
-auth-state-dependent test hazard in `src/cli/run.test.ts`.** Documented fully in §3 above. The review
-that approved Phase 3 named this precisely and chose, correctly, not to fix it itself (adding an
-injection seam to a spec-mandated function signature is a design decision, properly escalated rather
-than patched unilaterally). The architect directed the fix; I read commit `4588f9e`'s actual diff line
-by line (not the commit message) and independently ran the resulting tests. It is real and it works: the
-previously-hazardous test no longer depends on this machine's Codex-CLI auth state, and the CLI-level
-subprocess test that cannot accept dependency injection now forces a deterministic preflight failure by
-construction instead. This closes the one open item the Phase 3 review left on the record (see §6).
+**Real gap #1, and the one this pass was specifically directed to verify and state in my own words: the
+new reference-attestation guard can prove a claimed artifact path is real and truthfully hashed -- it
+cannot prove the dispatched agent's own reasoning genuinely incorporated that file's content.** I read
+`assertLooprArtifactsReferenced()` (`src/dispatch/artifacts.ts`) and `reconcileHandoffRecord()`
+(`src/dispatch/record.ts`, Phase 3, confirmed unmodified) together, not separately, because the guard's
+actual guarantee is the composition of both. Here is what I confirmed each one literally does:
+`reconcileHandoffRecord()`'s `reconcileFileRefs()` helper takes every `artifacts_read` entry the agent's
+own draft claims, recomputes its SHA-256 from the real file on disk at that repo-relative path, and
+silently drops (not fails) any entry whose path does not resolve to a real file at all. What survives
+into the *reconciled* record is therefore proof of exactly two things: the path is real, and the hash
+attached to it is the file's true current content hash -- not whatever hash the agent may have typed.
+`assertLooprArtifactsReferenced()` then does nothing more than check that `baby_prd.md`/`context.md`/the
+phase spec's paths each appear somewhere in that already-reconciled list; the function's own signature
+takes no hash parameter at all, confirming it relies entirely on reconciliation for the hash-truthfulness
+part and contributes only the presence check. Put together: the mechanism can catch an agent that never
+mentions a required artifact's path anywhere in its handoff note, or one that names a path that turns out
+not to exist, or one that names a stale/wrong file (reconciliation would attach that *file's* real hash,
+which is honest about what was actually read, but does not stop the path itself from being named without
+being opened). It cannot catch an agent that copies the artifact's path string -- which it necessarily
+already has, because the path is handed to it verbatim as part of its own turn instructions
+(`buildProtocolInstructions()`'s two new mandatory-content items, confirmed by reading `prompt.ts`
+directly: they literally interpolate `p.babyPrdRepoRelPath`/`p.contextRepoRelPath` into the prompt text)
+-- straight into its own self-reported `artifacts_read` list without ever genuinely opening the file.
+Nothing in `reconcileHandoffRecord()` or `assertLooprArtifactsReferenced()` observes whether a read
+syscall, a tool-use event, or any other trace of genuine file access occurred; both operate purely on the
+agent's own self-reported list of paths, filtered by mechanical existence-and-hash recomputation. This
+matches the Phase 4 approval commit's own UNCERTAIN escalation almost exactly, and having now read the
+actual code myself rather than transcribing that framing, I confirm it holds: the guard is a faithful,
+correct implementation of what `PHASE_4_SPEC.md` §6.1 literally specifies (path-membership-in-reconciled-
+list, nothing more), and what it specifies is genuinely narrower than "the agent read the file," even
+though the two are easy to conflate from the outside. This is not a defect introduced by Phase 4 --
+`HandoffRecord.artifacts_read` as a self-reported `FileRef` array is Phase 1's own original design
+(confirmed: `src/domain/relay.ts` is untouched this phase), and PRD §7 I2 itself describes the mechanism
+as "SHA-256 comparison between what a turn recorded as written and what the next turn recorded as read,"
+which is a claim about *recorded* paths and hashes, not about verified comprehension. Phase 4's own
+stated purpose is closing AC3's "not merely being handed their paths and ignoring them" gap, and what
+shipped closes the "never mentioned it at all" half of that sentence mechanically and completely, while
+the "mentioned it without reading it" half remains open by construction -- verifying genuine content
+engagement from outside a black-box LLM subprocess invocation is not something any purely file-hash-based
+mechanism can do, on this architecture or plausibly on any comparably-shaped one, without either reading
+the agent's own reasoning transcript (which PRD I5/FM2's isolation invariant forbids crossing the relay)
+or some other capability outside what V1 was scoped to build. I judge this a genuinely open structural
+limitation, not a closed one -- see §6.
 
-**Real gap #2, a genuine spec-vs-shipped-signature divergence, disclosed in the code's own comments but
-worth naming explicitly here because a third party diffing the spec's literal text against the code
-would find a real mismatch: `RunDispatchDeps`'s shape does not match `PHASE_3_SPEC.md` §6.5's literal
-text.** The spec's §6.5 code block declares exactly two optional fields (`adapters`, `runProcessFn`);
-the shipped `src/dispatch/run-loop.ts` declares three (`adapters`, `runProcessFn`, `preflightFn`). This
-is not an oversight -- `run-loop.ts`'s own doc comment names it as a deliberate autonomous-critique
-addition and states the reason (§3 above), and the reviewer's own approval commit shows independent
-awareness of the fix's shape ("the bounded retry is structurally scoped..." and the AC21 discussion both
-presuppose the injected `preflightFn` seam `run-loop.test.ts` actually uses). I confirm this reading is
-correct by direct inspection of both files. This is a disclosed, reasoned deviation, not an undisclosed
-one -- but it is still a real difference between what §6.5's code block states and what shipped, and the
-comprehension-pass discipline this project follows (documented in Phase 1's Windows erratum and Phase
-2's `[UNVERIFIED-P2]`-closure gap, both named in prior comprehension passes) is to name it plainly rather
-than let the spec's literal text stand uncorrected next to code that does something slightly different.
+**Real gap #2, confirmed by direct diff read: the minor, disclosed documentation mismatch the approval
+commit itself named.** `PHASE_4_SPEC.md` §1.7 states "no other file changes... `src/adapters/**`...
+untouched." I read the actual diff (`git diff a5a4567..6fd4c8a -- src/adapters/`) and confirmed:
+`src/adapters/claude-code.test.ts` and `src/adapters/codex-cli.test.ts` each gained exactly three lines
+(`babyPrdPath`, `contextPath`, `expectedArtifactPath: null` added to a shared `makeTurnRequest()` fixture
+helper), while the two production files, `claude-code.ts` and `codex-cli.ts`, are genuinely byte-identical
+to Phase 3. So §1.7's claim is not perfectly literal -- two test files under `src/adapters/**` did change
+-- but the change is mechanical and non-behavioral: `TurnRequest` gained three required fields this
+phase, and any fixture literal constructing a full `TurnRequest` must supply them to type-check, the same
+category of consequence `PHASE_3_SPEC.md` §1.2's own `RunConfig` fixture-cascade language already
+authorizes explicitly. The approval commit named this exact gap in its own text before I read the code,
+and I independently confirm the diff matches that description precisely.
 
-**A minor, non-blocking observation, not named by either review: `RunHaltedError` (added this phase,
-`src/domain/errors.ts`) is never actually constructed anywhere in the shipped code.** `PHASE_3_SPEC.md`
-§1.4 justifies adding this class with "it is the first phase that needs a concrete class for... the run
-stopped because the dispatched agent said it could not, or should not, continue." I grepped the full
-`src/` tree and confirmed `RunHaltedError` appears in exactly one file, its own declaration in
-`errors.ts` -- `run-loop.ts` reports a halted run by returning a `RunResult` object with
-`exitCode: ExitCode.RUN_HALTED` set directly, never by constructing or throwing a `RunHaltedError`
-instance. This is consistent with `run-loop.ts`'s own explicit contract ("never throws a
-`MultiLooprError` for a modelled failure... returns the exit code"), so it is not a bug -- `exitCodeFor()`
-never needs to see this particular error class because `runDispatch` never throws it -- but it means the
-class exists for schema/type-hierarchy completeness (parity with every other exit code having a matching
-error class) rather than because any code path actually constructs one. Not a spec violation (nothing in
-§8's acceptance criteria requires `RunHaltedError` to be thrown, only that `RUN_HALTED`'s exit code
-behaviour work, which it does, tested), but worth naming as a small mismatch between the class's stated
-justification and its actual (non-)use.
+**Carried forward from Phase 3, still true and re-confirmed this run: `RunHaltedError` remains declared
+in `src/domain/errors.ts` but is never constructed anywhere in the shipped code.** I grepped the full
+`src/` tree again this run: `RunHaltedError` still appears in exactly two places, its own class
+declaration and a doc-comment reference in `run-loop.ts`'s header explaining why it stays unconstructed
+(the comment was extended this phase, confirmed by reading the diff, specifically to note that
+`LooprArtifactBypassError` follows the opposite, already-established uncaught-throw pattern instead, and
+gives no new reason to change this). `PHASE_4_SPEC.md` §9 item 3 addresses this directly and states the
+correct resolution is either constructing it for real if a future phase refactors `run-loop.ts` toward
+uniformly throwing, or reconsidering whether the class needs to exist at all -- not forcing a construction
+site into this phase's unrelated additions. Confirmed this phase does neither, correctly, per its own
+stated non-goal.
 
-No other `PHASE_3_SPEC.md` clause I checked (§1's per-file additive/regression constraints, §2's
-no-new-dependency claim, §3's schema definitions, §4's CLI surface and exit-code table, §6.1-§6.7's
-function signatures and control flow, §7's failure-mode guard table, §8's 32 acceptance criteria I could
-check by direct execution or direct code reading, §9's non-goals) showed a divergence between what the
-spec states and what the code I read this run actually does.
+No other `PHASE_4_SPEC.md` clause I checked (§1's per-file additive/regression constraints, §2's
+no-new-dependency claim, §3's schema definitions including the deliberate no-change to `HandoffRecord`
+and `RunReport`, §4's exit-code table, §6.1-§6.4's function signatures and control flow, §7's
+failure-mode guard table, §8's 29 acceptance criteria I could check by direct execution or direct code
+reading, §9's non-goals) showed a divergence between what the spec states and what the code I read this
+run actually does.
 
 ## 6. Open items
 
-No open items are carried forward from the prior `COMPREHENSION.md`: Phase 2's own open items (the
-version-drift caveat on the four `[UNVERIFIED-P2]` flag-syntax confirmations) concerned Phase 2's
-adapter-flag-syntax confirmations specifically, not anything Phase 3's code depends on differently, and
-Phase 3 introduces no new provider CLI flags (`PHASE_3_SPEC.md` §0: "this spec introduces very little
-genuinely new external CLI-surface risk... it reuses `buildInvocation`'s already-verified output
-verbatim") -- so that caveat still stands, unchanged, as a standing environmental note rather than a
-Phase 3 open item. It is restated here for completeness rather than silently dropped: the four
-`[UNVERIFIED-P2]` flag-syntax confirmations from Phase 2 remain tied to this machine's specific
-`claude` 2.1.211 / `codex-cli` 0.128.0 versions; if either CLI is upgraded, those confirmations should be
-treated as needing re-verification, not as permanently settled.
+**New this phase, and the item this pass was specifically directed to evaluate for open-vs-closed
+status: the reference-attestation guard's inability to distinguish "genuinely read" from "path copied
+into the self-report without reading."** Documented fully in §5 above -- I judge this genuinely open,
+not closed, and I am recording it here rather than treating the approval commit's own escalation as
+already resolved by disclosure alone. Disclosure is not resolution: the mechanism `assertLooprArtifactsReferenced()`
+plus `reconcileHandoffRecord()` together provide is real and valuable (it closes the "never mentioned the
+artifact at all" bypass completely and mechanically), but it does not and structurally cannot close the
+"mentioned it, truthfully, without reading it" case, because doing so would require either crossing PRD
+I5/FM2's isolation boundary (feeding transcript/tool-trace data into the relay, which the architecture
+forbids on purpose) or some other verification capability this project has not built and was not scoped
+to build in V1. This is not something a future phase can casually "just fix" -- closing it for real is a
+capability question, not a bug-fix, and any future attempt should be evaluated against whether it would
+require weakening I5, not treated as a small addition. Until a future phase makes a deliberate,
+architect-reviewed decision either to accept this residual risk permanently (documented as such) or to
+add some new, disclosed verification capability that doesn't cross the isolation boundary, this stays
+open.
 
-The one item this phase's own review (`a5a4567`) placed on the record as unresolved -- the
-auth-state-dependent test hazard in `src/cli/run.test.ts` -- is now resolved, not carried forward. See
-§3 and §5 above for the full account: commit `4588f9e`, directed by the architect after approval,
-verified by me this run against the actual diff and by independently re-running the affected tests.
+**Carried forward from Phase 3's own comprehension pass, still true, re-confirmed this run: `RunHaltedError`
+is declared but never constructed anywhere in the shipped code.** See §5 above. `PHASE_4_SPEC.md` §9
+item 3 addressed this by name and confirmed it is correctly out of this phase's scope, not accidentally
+missed -- still worth a future phase's attention only if `run-loop.ts` is ever deliberately refactored
+toward uniformly throwing `MultiLooprError` subclasses (it currently, by explicit design, does not); at
+that point either construct `RunHaltedError` for real or reconsider whether the class needs to exist at
+all. Not urgent; not accidentally dropped.
 
-One new item surfaces from this run's own honesty audit, not previously flagged by either review: the
-minor `RunHaltedError`-never-constructed observation in §5. It does not block anything and is not a
-correctness defect, but is worth a future phase's attention if `run-loop.ts` is ever refactored toward
-throwing `MultiLooprError` subclasses more uniformly (it currently deliberately does not, by its own
-stated design) -- at that point, either construct `RunHaltedError` for real or reconsider whether the
-class needs to exist at all.
+**Carried forward from Phase 2's own comprehension pass, still true, standing environmental note rather
+than an active defect: the four `[UNVERIFIED-P2]` flag-syntax confirmations remain tied to this
+machine's specific `claude` 2.1.211 / `codex-cli` 0.128.0 versions.** Phase 4 introduces no new provider
+CLI flags (`PHASE_4_SPEC.md` §0: "this spec introduces no new external CLI-surface risk at all... reuses
+`buildInvocation`'s already-verified output verbatim"), confirmed by reading `artifacts.ts` and the
+modified files directly: none of them import `runProcess`, spawn a process, or construct provider argv.
+If either CLI is upgraded, those four confirmations should be treated as needing re-verification, not as
+permanently settled.
 
-One forward-looking note, not an unresolved item but worth stating plainly for the operator: Phase 3's
-own explicit non-goals (`PHASE_3_SPEC.md` §9) mean multi-loopr still cannot loop across loopr phases on
-its own, still produces no real `PHASE_(N+1)_SPEC.md` content from its reviewer turn, and still collects
-no AC1-AC3 evidence -- all three remain deferred to Phase 4/5 as planned, not accidentally dropped.
+The one item Phase 3's own review left open (the auth-state-dependent test hazard in
+`src/cli/run.test.ts`) was resolved by the post-approval fix commit `4588f9e` and confirmed closed in the
+Phase 3 comprehension pass; it is not carried forward here as it remains genuinely resolved -- no code
+touched by Phase 4 reopens it.
+
+One forward-looking note, not an unresolved item but worth stating plainly for the operator:
+`PHASE_4_SPEC.md` §9's own explicit non-goals mean multi-loopr still does not validate the *content* or
+*shape* of any produced artifact (only its provenance), still does not infer or detect which phase of a
+target build is final (`is_final_phase` is purely operator-supplied), and still dispatches exactly one
+loopr phase's turn sequence per `run` invocation with no autonomous looping across phases -- all
+deliberately deferred, most explicitly to Phase 5's acceptance harness, not accidentally dropped.
 
 ## Phase Log
 
@@ -409,3 +462,33 @@ injectable `deps?: RunDispatchDeps` parameter to `runRunCommand`, mirroring the 
 this run against the actual diff and by re-running the affected tests: 196/196 overall, all 10 of
 `run.test.ts`'s own tests passing in isolation) while leaving `src/cli/main.ts`'s real call site --
 which never passes `deps` -- byte-identical to before the parameter existed.
+
+**Phase 4 -- 2026-08-16.** loopr artifact integration. Shipped the second gap `PHASE_3_SPEC.md` §9
+deferred by name: two new deterministic guards, `assertLooprArtifactsReferenced()` and
+`assertNextPhaseSpecProduced()` (new file `src/dispatch/artifacts.ts`, alongside pure helper
+`nextPhaseSpecPath()`), wired into `runTurn()` between reconciliation and neutral-commits assertion.
+Every dispatched turn (both executors and the reviewer) must now genuinely reference `baby_prd.md`,
+`context.md`, and the phase spec in its reconciled `artifacts_read`, checked against the record Phase
+3's `reconcileHandoffRecord()` already ground-truths; the reviewer turn specifically must also produce
+the run's next artifact (`PHASE_(N+1)_SPEC.md`, or `BUILD_COMPLETE.md` on a new operator-supplied
+`RunConfig.is_final_phase: true`) as both a declared `artifacts_written` entry and a real, turn-committed
+file, checked via `changedPaths()` (Phase 1, unmodified). Either guard failing throws the new
+`LooprArtifactBypassError` (`ExitCode.LOOPR_ARTIFACT_BYPASSED = 12`), uncaught, zero retry, before the
+record is ever persisted -- the same shape `assertNeutralCommits()`'s `BoundaryViolationError` already
+established. `RunConfig`/`TurnRequest` (`src/domain/run.ts`), `src/domain/errors.ts`,
+`src/dispatch/prompt.ts`, `src/dispatch/turn.ts`, and `src/dispatch/run-loop.ts` were modified, each
+confirmed additive; `src/verify/**` and `HandoffRecord` (`src/domain/relay.ts`) are untouched -- both new
+guards operate entirely on the existing `FileRef` arrays Phase 1 already shipped, no schema change. The
+phase's own adversarial review (commit `6fd4c8a`) found no code-level defect, confirmed 220/220 tests and
+28/0 boundary scan, and named one minor documentation-only mismatch (two `src/adapters/**` test fixture
+files needed three mechanical lines each, contradicting §1.7's fully-literal "untouched" claim, though
+the production adapter files themselves are genuinely untouched). The review separately escalated, as
+UNCERTAIN rather than a blocking defect, a structural limitation of the new reference-attestation guard:
+it can prove a self-reported artifact path resolves to a real file with a truthfully recomputed hash, but
+cannot prove the dispatched agent's own reasoning genuinely incorporated that file's content rather than
+copying its path from the prompt into a self-report without reading it -- a limitation inherited from
+Phase 1's original `HandoffRecord.artifacts_read` self-report design, not introduced by this phase, and
+one that cannot be closed without either crossing PRD I5's isolation boundary or adding a verification
+capability outside V1's scope. This comprehension pass independently read `assertLooprArtifactsReferenced()`
+and `reconcileHandoffRecord()` together and confirmed the finding holds; it is recorded as a genuinely
+open item (§5, §6 above), not treated as closed by disclosure alone.
