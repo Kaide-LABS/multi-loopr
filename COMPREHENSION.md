@@ -12,274 +12,338 @@ central relay service sitting in between. Think of it as a relay race: one assis
 work, then hands the baton to the other, which is expected to genuinely continue that work rather than
 redo it, ignore it, or quietly undo it.
 
-Phase 1 built the plumbing the race runs on (the handoff-note format, the readiness checker, the
-locking mechanism, the internal rulebook, the way to check a handoff was honored) but could not yet
-actually talk to either assistant.
+Phase 1 built the plumbing the race runs on. Phase 2 taught the tool how to speak each assistant's own
+language (the exact command-line words, the effort dial, the pass/fail reader) but never actually
+pressed the button.
 
-This phase teaches the tool how to *speak each assistant's own language*. For each of the two
-assistants, multi-loopr now knows: the exact command-line words to type to start a turn in a way that
-never stops to ask a human a permission question partway through (a silent hang would be worse than a
-clear failure); how to translate an abstract "how much effort should this turn get" setting into that
-specific assistant's own effort dial; and how to read the assistant's own output afterward and decide,
-in a strict, checklist-driven way, whether the turn actually succeeded, failed, or ran out of time --
-never by asking the assistant itself to self-report the answer.
+This phase presses the button. multi-loopr can now actually run a race: given a small configuration
+file (which two assistants to use, which repository, which numbered project-phase document to work
+from, and how long to let a turn run before giving up on it), it dispatches a real, fixed three-leg
+sequence -- one assistant goes first, the other assistant continues that work, and then one of the two
+reviews the combined result -- and it does this for real: it spawns the actual assistant CLI, waits for
+it to finish or time out, and reads back whatever handoff note that assistant wrote to disk.
 
-This phase deliberately still does not press the button. Nothing in this phase actually launches
-either assistant to do real work, writes any real handoff note to disk, takes the exclusive lock, or
-offers an operator-facing command to start a run. What got built this phase is the translator and the
-verdict-reader for each assistant; wiring them into an actual back-and-forth loop is next.
+The most important new idea this phase introduces is that multi-loopr never simply believes what an
+assistant claims about its own work. Every assistant's turn ends with it writing a note that includes
+claims like "here is the git commit I made" or "here is the file I changed, and here is that file's
+fingerprint." This phase throws every one of those specific claims away and recomputes them itself,
+directly from the real git history and the real files on disk, before trusting the note for anything
+that matters. An assistant can still describe, in its own words, what it did and what's left to do --
+that part is trusted -- but never the parts a dishonest or simply mistaken assistant could fake to make
+its own turn look more successful than it was.
 
-Also worth understanding in plain terms: multi-loopr already caught itself in a small honesty gap once
-before, in Phase 1 (a documented, disclosed platform-specific quirk on Windows that the original plan
-hadn't anticipated), and formally corrected the plan document itself to describe it rather than leaving
-the written plan and the real behavior silently out of step. This phase's own build reused that lesson
-directly: partway through, a reviewer noticed the newly-written code's own explanatory notes had quietly
-skipped documenting one thing it had actually verified, and closed that gap the same way -- writing it
-down explicitly rather than leaving it implicit.
+The second new idea is a safety net for the handoff itself: after each assistant's turn, multi-loopr
+runs the same strict, mechanical continuity check Phase 1 built (did the next turn actually build on the
+last one, or did it quietly ignore or undo it?). If that check fails once, multi-loopr gives the same
+assistant exactly one more try, explicitly telling it what went wrong -- but only ever one extra try,
+and only for that specific kind of failure. Any other kind of problem (a crash, a timeout, an assistant
+that honestly reports it got stuck) stops the whole run immediately, with no retry, because those are
+not situations where "try again" is an honest response.
+
+This phase still does not do any of the real work of the loopr method itself: it does not draft a real
+project-phase document, and it does not loop across phases on its own -- one invocation of the tool
+plays exactly one three-leg race and then stops, the same way this project's own operator manually
+re-runs its own review-and-comprehension steps between phases rather than letting them self-chain.
+
+Also worth understanding in plain terms, because it happened again this phase in a slightly new shape:
+a reviewer signed off on this phase's code, and separately flagged -- explicitly, in writing, without
+fixing it -- one thing they had noticed but judged out of scope for their own pass: two of the newly
+written tests only avoided a real risk (accidentally starting a real assistant turn just by running the
+test suite) because of a coincidence of this one development machine's current login state, not because
+the code was actually built to prevent it. The operator directed a follow-up fix, done after the
+review's own approval, that closes this properly: it gives that specific piece of code a way to be
+handed fake stand-ins during a test, the same way every other part of this phase's code already could
+be, so the tests no longer depend on which assistant happens to be logged in on whichever machine runs
+them.
 
 ## 2. Architecture walkthrough
 
-Every file below was read in full this run and exists in the repository at the stated path. Phase 1's
-architecture (unchanged this phase, so not re-described in full here) remains as `COMPREHENSION.md`'s
-own Phase 1 entry in the Phase Log below records it.
+Every file below was read in full this run and exists in the repository at the stated path. Phases 1
+and 2's own architecture (unchanged this phase, so not re-described here) remain as `COMPREHENSION.md`'s
+own Phase 1/2 entries in the Phase Log below record them.
 
-**New this phase: `src/adapters/`** -- the concrete implementations of the `ProviderAdapter` interface
-Phase 1 shipped as a declaration only.
-- `src/adapters/claude-code.ts` -- `ClaudeCodeAdapter`, driving the `claude` CLI in headless (`-p`)
-  mode. Exports `CLAUDE_EFFORT_VALUES` (`low`/`medium`/`high`/`xhigh`/`max`) and the class itself, which
-  implements `id`, `preflight()`, `resolveEffort()`, `buildInvocation()`, `interpretResult()`.
-- `src/adapters/claude-code.test.ts` -- unit tests plus one call into the shared conformance suite.
-- `src/adapters/codex-cli.ts` -- `CodexCliAdapter`, driving `codex exec`. Exports `CODEX_EFFORT_VALUES`
-  (`minimal`/`low`/`medium`/`high`/`xhigh`) and the class, same four-method shape.
-- `src/adapters/codex-cli.test.ts` -- unit tests plus one call into the shared conformance suite.
-- `src/adapters/conformance.ts` -- `assertAdapterConformance(adapter, fixture)`, a synchronous,
-  provider-agnostic battery of eight checks (identity, `resolveEffort` totality/purity, `buildInvocation`
-  purity and non-mutation, forbidden-flag absence, `env` non-credential-forging, timeout precedence,
-  `record` always `null`) that both adapters' own test files call against themselves, so the contract is
-  verified identically rather than re-implemented per adapter. Not itself a `*.test.ts` file.
-- `src/adapters/registry.ts` -- `ADAPTER_REGISTRY`, a frozen, two-entry object mapping
-  `"claude-code"`/`"codex-cli"` to one stateless instance of each adapter class. First value of type
-  `AdapterRegistry` this project has shipped (Phase 1's `src/ports/provider-adapter.ts` declared the
-  type only).
-- `src/adapters/registry.test.ts` -- confirms the registry has exactly one entry per `PROVIDER_IDS`
-  member, each entry's own `id` field matches the key it's stored under, and the object is frozen.
+**New this phase: `src/dispatch/`** -- the turn-sequencing and orchestration layer, the first new
+top-level `src/` directory since Phase 2's `src/adapters/`.
+- `src/dispatch/plan.ts` -- `otherProviderId(id)` (total over the two `PROVIDER_IDS`, throws
+  `InternalError` for an unreachable input) and `planTurnSequence(config)`, which resolves PRD §6.3's
+  DECISION into the fixed three-slot `TurnPlan[]`: executor on `executor_providers[0]`, executor on
+  `executor_providers[1]`, reviewer on `reviewer_provider ?? otherProviderId(executor_providers[1])`.
+- `src/dispatch/plan.test.ts` -- sequence correctness, the reviewer default vs. an explicit override,
+  `otherProviderId` totality and its defensive throw.
+- `src/dispatch/prompt.ts` -- `buildProtocolInstructions()`, `buildHandoffContext()`,
+  `buildExecutorPrompt()`, `buildReviewerPrompt()`. Assembles each dispatched turn's actual prompt text
+  from a role profile (Phase 1, unchanged) plus protocol instructions plus, where applicable, the prior
+  turn's allow-listed context and (for the reviewer only) the real git diff between the two executor
+  turns, capped at 20,000 characters with a `"truncated"` marker past the cap. No function in this file
+  reads `process.env`, spawns a process, or touches a clock.
+- `src/dispatch/prompt.test.ts` -- the six mandatory protocol-instruction items tested individually by
+  substring; the allow-list boundary (`buildHandoffContext` proven not to leak `schema_version`,
+  `run_id`, or `model_tier`); diff truncation; retry-note appending.
+- `src/dispatch/record.ts` -- `captureGroundTruthBefore(repoDir)` and
+  `reconcileHandoffRecord(repoDir, draft, ground)`. The latter unconditionally replaces the
+  agent-authored `repo`, `spec_ref`, and every `artifacts_read`/`artifacts_written` entry's `sha256`
+  with independently-computed ground truth (a dropped, non-fatal outcome for a declared path that does
+  not exist on disk), then re-runs `HandoffRecord.safeParse` on the reconciled object, throwing
+  `RelaySchemaError` on a reconciliation-triggered failure distinct from a raw schema defect.
+- `src/dispatch/record.test.ts` -- reconciliation exercised against real temporary git repositories; a
+  deliberately wrong agent-authored `repo`/`spec_ref`/artifact hash is proven overwritten.
+- `src/dispatch/turn.ts` -- `runTurn(req, deps)`. One turn end to end, in a fixed order: capture ground
+  truth, build the invocation via the adapter, merge the environment as
+  `{ ...process.env-with-undefined-dropped, ...invocation.env }` (never `invocation.env` alone), spawn
+  via an injectable `runProcessFn` (defaults to the real `runProcess`), interpret the result, read the
+  on-disk `HandoffRecord` (a `RelaySchemaError`/`IsolationLeakError` here becomes a modelled failure, not
+  a throw), reconcile it against ground truth, assert commit neutrality on the real commit list when any
+  exist, then persist the reconciled record at the same path, overwriting the agent's own draft.
+- `src/dispatch/turn.test.ts` -- full turn lifecycle against a real temporary git repo, with an
+  injectable `runProcessFn` fixture; dedicated tests for the adapter-failure short-circuit, the
+  malformed-record and isolation-leak modelled-failure conversions, the reconciliation-rejection case,
+  the uncaught `BoundaryViolationError` propagation, the environment-merge contract, and timeout
+  pass-through.
+- `src/dispatch/run-loop.ts` -- `runDispatch(config, deps?)`, the top-level orchestrator: an extended
+  preflight (Phase 1's `runPreflight()` plus a `spec_path`-readability check, folded into one
+  `PREFLIGHT_FAILED` outcome), the run lock acquired before any turn and released in a `finally` wrapping
+  the entire turn loop, then the fixed three-slot loop with the bounded, exactly-one, non-`CONTINUED`
+  -verdict-only retry. `RunDispatchDeps` carries `adapters`, `runProcessFn`, and (an autonomous-critique
+  addition beyond the spec's literal two-field interface, explained in §3 below) `preflightFn`, all
+  optional and each defaulting to the real production dependency when omitted.
+- `src/dispatch/run-loop.test.ts` -- end-to-end dispatch scenarios against real temporary git repos with
+  an injected fake `AdapterRegistry`/`runProcessFn`/`preflightFn`: a clean 3-turn run; a continuity
+  failure that retries once and succeeds; a continuity failure on both the original and the retry
+  (`CONTINUITY_FAILED`, exit 6); a `"halted"` record stopping the run immediately (`RUN_HALTED`, exit
+  11); an adapter-reported failure with zero retry; an unexpected `BoundaryViolationError` throw that
+  still releases the lock; lock contention (`LOCK_HELD`, exit 8); a missing `spec_path` failing
+  preflight before the lock is ever touched.
 
-**Modified this phase (all confirmed additive by reading the diff directly, not by trusting the spec's
-own characterization of itself):**
-- `src/domain/errors.ts` -- gains `ExitCode.TURN_TIMEOUT = 10` (appended after the existing nine, none
-  renumbered) and `class TurnTimeoutError extends MultiLooprError`.
-- `src/domain/run.ts` -- `TurnRequest` gains one new required field, `modelOverride: string | null`.
-  Verified no Phase 1 code constructs a `TurnRequest` literal (Phase 1 shipped no dispatch code), so
-  this cannot regress an existing caller.
-- `src/ports/provider-adapter.ts` -- `Invocation.env`'s doc comment is extended to state the merge
-  contract: `env` is an additive overlay a future spawn site must apply as
-  `{ ...process.env, ...invocation.env }`, never as a full replacement. No type or method signature
-  changed.
-- `src/verify/preflight.ts` -- gains `buildProviderPreflightReport(id: ProviderId): Promise<PreflightReport>`,
-  the exact per-provider assembly block (`checkProviderCli` -> version-range check -> conditional
-  `checkProviderAuth` -> problems list -> `PreflightReport`) that `runPreflight()`'s loop body already
-  computed inline in Phase 1, now extracted so both `runPreflight()` (one call site, rewritten as a
-  `for` loop over `PROVIDER_IDS`) and each adapter's own `preflight()` method call the identical logic.
-  `src/verify/preflight.test.ts` (Phase 1, unmodified) still passes, which is the direct evidence the
-  extraction changed no observable behavior.
+**New this phase: `src/cli/run.ts`** -- `RunReport` (`z.strictObject`, mirroring `DoctorReport`'s shape)
+and `runRunCommand(opts, deps?)`: reads and validates the `--config` JSON file against `RunConfig`
+(a failure here is `UsageError`, exit 2, deliberately distinct from `RELAY_SCHEMA_INVALID`'s exit 4,
+which is reserved for the inter-agent `HandoffRecord` payload specifically), calls `runDispatch()`, and
+assembles the report. `deps` (added post-approval, see §3/§5) threads straight through to `runDispatch`'s
+own second argument and is `undefined` by default, so `src/cli/main.ts`'s real call site -- which never
+passes it -- is byte-identical to before the parameter existed.
+- `src/cli/run.test.ts` -- CLI-level config-file validation errors, `--json` output shape, exit-code
+  passthrough, `RunConfig`'s two new fields each rejecting an invalid value. As of the post-approval fix
+  (§3/§5), the direct `runRunCommand` "dispatches a valid config" test drives a full injected fake
+  `RunDispatchDeps` (a synthetic always-healthy preflight, a `RecordingFakeAdapter` pair, and a scripted
+  `runProcessFn` that writes real commits and real `HandoffRecord` files into a temp repo) through a
+  clean 3-turn run, and the real-subprocess `--json` CLI test uses a `spec_path` that can never resolve
+  to a readable file, so it deterministically fails preflight before the turn loop, on any machine, in
+  any provider-auth state.
 
-No other file changed this phase: `src/cli/main.ts`, `src/cli/doctor.ts`, `src/verify/boundary.ts`,
-`src/verify/boundary-rules.ts`, `src/domain/relay.ts`, `src/domain/tiers.ts`, `src/domain/roles.ts`, and
-everything under `src/util/` are byte-identical to the Phase 1 tip (confirmed: `git diff` between the
-two approval commits touches no path under any of those).
+**Modified this phase (all confirmed additive by reading the diff directly):**
+- `src/domain/run.ts` -- `RunConfig` gains two new required fields: `phase: z.number().int().min(1)` and
+  `spec_path`, validated against a locally-declared `RepoRelPathLike` schema (not imported from
+  `src/domain/relay.ts`'s `RepoRelPath`, to avoid creating an ES-module import cycle between the two
+  files -- `run.ts`'s own header comment states this constraint explicitly) built from the same
+  underlying `isSafeRepoRelPath` (`src/util/paths.ts`) both files already share.
+- `src/domain/errors.ts` -- gains `ExitCode.RUN_HALTED = 11` (appended after the existing ten, none
+  renumbered) and `class RunHaltedError extends MultiLooprError`.
+- `src/util/paths.ts` -- gains `repoRelToAbs(repoDir, repoRelPath)`, plain string concatenation
+  (deliberately not `node:path.join`/`resolve`), safe because its input has always already passed
+  `isSafeRepoRelPath`.
+- `src/verify/git.ts` -- gains `diffText(repoDir, fromOid, toOid)`: `git diff <fromOid>..<toOid>`, the
+  full unified diff body (unlike the existing `changedPaths`, which returns only names), following the
+  file's existing non-zero-exit-throws-`InternalError` wrapper convention.
+- `src/cli/main.ts` -- gains recognition of a `run` command (`--config <path>`, `--json`) inside
+  `parseArgs` (a new `parseRunArgs` function) and a new `case "run"` branch in `main()`'s dispatch
+  switch, plus `renderRunHumanReport()`. Every existing command's parsing and behaviour is unchanged --
+  the diff only adds new branches, touching no existing one.
+- `README.md` -- gains exactly one new sentence noting the `run` command exists.
+
+No other file changed this phase: `src/adapters/**`, `src/verify/preflight.ts`,
+`src/verify/continuity.ts`, `src/verify/boundary.ts`, `src/verify/boundary-rules.ts`,
+`src/verify/commits.ts`, `src/domain/relay.ts`, `src/domain/tiers.ts`, `src/domain/roles.ts`,
+`src/ports/provider-adapter.ts`, `src/util/exec.ts`, `src/util/hash.ts`, `src/util/lock.ts`, and
+`src/cli/doctor.ts` are byte-identical to the Phase 2 tip (confirmed: `git diff` between the two
+approval commits touches no path under any of those).
 
 Verified this run by direct execution, not merely by reading source: `npm run typecheck` exits `0` with
-no diagnostics; `node --test "src/**/*.test.ts"` runs 152 tests, all passing (up from Phase 1's 125,
-consistent with the seven new adapter/registry test files); `node src/cli/main.ts doctor --boundary`
-reports 21 files scanned (up from Phase 1's 17, exactly the four new non-test files under
-`src/adapters/`), 0 violations; `node src/cli/main.ts doctor --providers --json` on this machine
-resolves `claude-code` as `authenticated: true` and `codex-cli` as `authenticated: false` with a
-non-empty `problems` array, live and reproducible, matching `PHASE_2_SPEC.md` §8 acceptance criterion
-20 exactly.
+zero diagnostics; `npm run check` (typecheck + full test suite + boundary scan) exits `0`, reporting 196
+passing tests and 27 files scanned with 0 boundary violations; `node --test src/cli/run.test.ts` run in
+isolation shows all 10 of that file's tests passing, including the two tests the post-approval fix
+commit rewrote.
 
 ## 3. Decisions and tradeoffs
 
-**`bypassPermissions` chosen as Claude Code's permission mode, over five other documented options.**
-`src/adapters/claude-code.ts`'s `buildInvocation` hard-codes `--permission-mode bypassPermissions`,
-unconditionally, in every branch. The code's own comment and `PHASE_2_SPEC.md` §6.1 state this was
-chosen because it is the only documented value among `acceptEdits`/`auto`/`bypassPermissions`/
-`manual`/`dontAsk`/`plan`/`default` that guarantees zero interactive tool-use prompts
-*deterministically* rather than *probabilistically* -- the property PRD AC2 and FM7 both require. The
-tradeoff, stated explicitly in the spec rather than left implicit: this is multi-loopr's own choice
-among vendor-documented options, not a vendor mandate, so a future phase revisiting permission
-granularity (e.g. per-tool confirmation) would need to consciously walk this back rather than assume it
-was forced.
+**Ground-truth reconciliation replaces the agent's self-reported `repo`/`spec_ref`/artifact hashes
+outright, rather than comparing and rejecting on mismatch.** `PHASE_3_SPEC.md` §6.3 states the
+alternative considered and rejected explicitly: a "compare and reject" design would require the agent's
+own prompt instructions to get git plumbing and hashing exactly right merely to avoid a spurious
+rejection, adding fragility for no security benefit, since ground truth is always independently
+available and cheap to compute. The tradeoff taken: the agent's own claims about these specific fields
+are never even consulted for correctness, only discarded -- the agent is told this up front in its own
+protocol instructions (`buildProtocolInstructions`'s "advisory only... overwrites" clause, confirmed
+present in `prompt.ts` and tested in `prompt.test.ts`), so this is a disclosed constraint on the agent,
+not a silent one.
 
-**`--bare` (Claude) is permanently rejected, at real cost to startup-context determinism guarantees.**
-Both `buildInvocation` methods never emit `--bare`, enforced by a dedicated test in each adapter's own
-test file and by `assertAdapterConformance`'s check 5. Per PRD §9 FM8 (verified this run by reading the
-PRD directly): `--bare` is the vendor-recommended mode for scripted calls, but it disables OAuth/
-keychain credential reading and would force an `ANTHROPIC_API_KEY`, silently breaking the
-BYOA-by-subscription login model multi-loopr's own preflight/auth logic already depends on. The
-tradeoff taken instead: startup-context determinism is obtained the harder way, via three explicit
-flags (`--setting-sources project`, `--strict-mcp-config`, `--allowedTools <fixed list>`) rather than
-one blanket flag -- more surface area to keep correct as the vendor's CLI evolves, in exchange for not
-regressing the credential model.
+**Reconciliation can make a record fail validation even though the agent's own draft parsed cleanly.**
+`reconcileHandoffRecord` re-runs `HandoffRecord.safeParse` on the reconciled object as its final step
+(`src/dispatch/record.ts` lines 93-101) -- an agent claiming `status: "completed"` with zero real commits
+now fails schema refinement R3 even though its own draft, before reconciliation, would have parsed. The
+tradeoff: an honest agent that is merely bad at git bookkeeping is treated identically to a dishonest
+one, by design -- multi-loopr does not attempt to distinguish "the agent lied" from "the agent's
+plumbing was wrong," because I2 forbids trusting the agent's self-report for exactly the fields being
+checked either way.
 
-**`codex exec -a`/`--ask-for-approval` is permanently rejected -- not a stylistic choice but a
-correction of what PRD §9 FM7 calls "the single highest-value correction" of the whole modernization
-pass.** The PRD records (and I independently confirmed by reading `docs/modernization_log.md`'s cited
-local probe) that `codex exec -a never --help` on the installed binary actually returns `error:
-unexpected argument '-a' found`; `-a` exists only on the top-level interactive `codex` command, not
-`exec`. `buildInvocation` instead sets the same intent via `-c approval_policy="never"` plus `--sandbox
-workspace-write`, unconditionally. `--full-auto` is separately never emitted either (deprecated in favor
-of the explicit `--sandbox` flag). Tradeoff: none really -- this is a case where the spec's original
-plan was simply wrong about the real CLI's surface, and Phase 2's code follows the corrected PRD
-guidance rather than the more "obvious"-looking flag a naive implementation might have reached for.
+**Retries are bounded to exactly one, and scoped to exactly one failure class: a non-`CONTINUED`
+continuity verdict.** Every other failure path in `run-loop.ts` (an adapter-reported process failure or
+timeout, a `RelaySchemaError`/`IsolationLeakError` from record read or reconciliation, a
+`LockHeldError`, a `PreflightError`, a `BoundaryViolationError` from `assertNeutralCommits`) returns or
+propagates on first occurrence with zero retry, verified by reading `run-loop.ts` directly: there is
+exactly one retry code path (the `verdict.verdict !== "CONTINUED"` branch), no loop construct anywhere
+in the file, and dedicated tests in both `run-loop.test.ts` and `turn.test.ts` confirm each of the other
+failure classes retries zero times. The tradeoff, stated in `PHASE_3_SPEC.md` §9 item 13: this bound is
+hardcoded, not an operator-tunable setting, deliberately -- an unbounded or configurable retry count was
+explicitly ruled out of scope.
 
-**`stdin: req.prompt`, not a positional CLI argument, for both adapters.** Both adapters pipe the
-turn's prompt through stdin (`"-"` explicitly for Codex; an absent positional argument for Claude)
-rather than passing it as a trailing argv element. The stated reason in both files is avoiding an OS
-command-line length ceiling for a large, loopr-spec-shaped prompt. For Claude specifically, this was
-initially shipped with the "no-argument implies stdin" behavior tagged `[UNVERIFIED-P2]` in the spec
-(§6.1); see §5 below for how and when this was actually closed.
+**`RunDispatchDeps` gained a third field, `preflightFn`, beyond what `PHASE_3_SPEC.md` §6.5 literally
+specified (`adapters`, `runProcessFn` only) -- a real, disclosed autonomous-critique addition, not a
+silent deviation.** `run-loop.ts`'s own doc comment on `RunDispatchDeps` states the reasoning directly:
+`runPreflight()` (Phase 1, unchanged) always shells out to the real `claude`/`codex` binaries with no
+injection seam of its own, so without `preflightFn` it would be structurally impossible for any test to
+reach `runDispatch`'s own turn-loop logic (lock, planning, continuity retry, halt) without both provider
+CLIs being genuinely installed and authenticated on the test-running machine -- directly contradicting
+§8 acceptance criterion #30's explicit requirement that no test in this phase spawn a real provider
+process. The tradeoff: `runDispatch`'s actual shipped signature is not byte-identical to the spec's
+literal §6.5 interface text, but production behaviour is unaffected (`preflightFn` defaults to the real
+`runPreflight`, and `src/cli/run.ts`'s own call site never passed a `deps` object at all prior to the
+post-approval fix below) -- this is exactly the kind of legitimate, disclosed spec deviation
+`PHASE_3_SPEC.md` §0's own standing constraint anticipates ("HALT and escalate... do not silently
+substitute a plausible-looking alternative"), and the reviewer's approval commit confirms it reviewed
+and accepted this addition rather than missing it.
 
-**`interpretResult` keys on `raw.exitCode !== 0`, never on `raw.exitCode === null` specifically, in
-both adapters.** This is a direct, demonstrated compliance with the Phase 1 Windows `exitCode:null`
-erratum (see §5/§6 below) -- confirmed by reading both `interpretResult` implementations line by line:
-`claude-code.ts` line 144 and `codex-cli.ts` line 161 both branch on `raw.exitCode !== 0`, so a
-spawn-level failure (`exitCode: null`) and any other non-zero exit are treated identically as failure,
-with no code path anywhere in either adapter that distinguishes `null` from a real non-zero value. The
-tradeoff: multi-loopr cannot currently tell "the CLI genuinely isn't installed" apart from "the CLI ran
-and exited with a real error code" from `interpretResult`'s signal alone -- but this was already an
-accepted, documented tradeoff from the erratum, not a new one Phase 2 introduced.
-
-**`buildProviderPreflightReport` extracted into `src/verify/preflight.ts` rather than duplicated inside
-each adapter.** `PHASE_2_SPEC.md` §1.5 states the alternative considered and rejected: writing the same
-version-range/auth-interpretation assembly logic inside each adapter file instead, which would create
-two independently-maintained copies of it. The tradeoff taken: a Phase 1 file was modified (additively)
-rather than kept untouched, in exchange for a single source of truth an adapter's `preflight()` and
-`multi-loopr doctor` can never disagree about.
+**`runRunCommand` gained an injectable `deps?: RunDispatchDeps` parameter after Phase 3's own approval,
+not before -- a disclosed, architect-directed post-approval fix, not a unilateral change.** The review
+that approved Phase 3 (`a5a4567`) explicitly named, as a non-blocking finding it chose not to fix itself,
+that two of `src/cli/run.test.ts`'s tests exercised a real, un-injected `runDispatch(config)` call and
+were only safe because this specific development machine's Codex CLI happens to be unauthenticated --
+on a fully authenticated machine, the same tests could have dispatched a real provider-CLI turn as a
+side effect of running `npm test`. Commit `4588f9e` closes this by adding the same kind of injection
+seam `runDispatch` itself already had, threaded one layer up. I independently read this commit's actual
+diff (not the commit message alone) and confirm: it touches exactly two files (`src/cli/run.ts`,
+15 lines changed; `src/cli/run.test.ts`, 193 lines changed, no other file); `runRunCommand`'s new second
+parameter is optional and defaults to `undefined`, so `src/cli/main.ts`'s real call site -- itself
+untouched by this commit -- passes no `deps` argument and reaches `runDispatch(config, undefined)`,
+byte-identical production behaviour to before the parameter existed; the previously-hazardous test now
+drives a full injected `RunDispatchDeps` (a synthetic always-healthy preflight, a fake
+`AdapterRegistry`, and a scripted `runProcessFn` that writes real commits and real `HandoffRecord` files
+into a temp repo) through a genuine clean 3-turn run, asserting on the exact turn-by-turn status/verdict
+sequence rather than merely on a preflight-failure passthrough; the one CLI-level test that spawns a
+real `node src/cli/main.ts run` subprocess correctly cannot accept an injected `deps` (main.ts's own call
+site intentionally never threads one), so it instead uses a `spec_path` that can never resolve to a
+readable file, forcing a deterministic `PREFLIGHT_FAILED` before the turn loop is ever reached,
+regardless of machine or provider-auth state. I ran `npm run check` and `node --test src/cli/run.test.ts`
+myself at the current tip: 196/196 tests pass overall, and all 10 tests in `run.test.ts` pass in
+isolation, including the two rewritten by this commit. The tradeoff: none of substance -- this closes an
+UNCERTAIN item the reviewer explicitly declined to resolve unilaterally (correctly, since adding an
+injection seam to a spec-mandated function signature is a design decision, not a QA patch) by having the
+architect make the call instead, exactly the escalation path `PHASE_3_SPEC.md` §0 describes.
 
 ## 4. Domain mechanics
 
-**Effort-value sets and the tier -> effort maps** (`src/adapters/claude-code.ts`'s `CLAUDE_EFFORT_VALUES`
-= `low`/`medium`/`high`/`xhigh`/`max`; `src/adapters/codex-cli.ts`'s `CODEX_EFFORT_VALUES` =
-`minimal`/`low`/`medium`/`high`/`xhigh`; both adapters' private `TIER_TO_EFFORT` maps sending
-`research-grade`/`verification-grade` -> `high` and `high-volume-low-effort` -> `low` for both
-providers). Source: `docs/modernization_log.md` §1, cited in both adapter files' own doc comments as
-`[VERIFIED-LOCAL]` (Claude, against the installed v2.1.211 binary's own `--help` text) and
-`[VERIFIED-DOC]` (Codex, against `https://learn.chatgpt.com/docs/config-file/config-reference`). I did
-not independently re-fetch either source this run; this citation is inherited from the PRD's own Step
-10 research pass and from Phase 2's own build-time re-confirmation recorded in the code comments, not
-independently re-verified against the vendor pages by me this run -- **[UNVERIFIED]** beyond that
-inherited chain.
+**The three-slot turn sequence's provider assignment is a mechanical, non-arbitrary reading of PRD
+§6.3's DECISION, not a new domain figure.** `planTurnSequence` resolves "the reviewer runs on whichever
+provider did not produce the diff under review" (PRD §6.3, read directly this run) into
+`otherProviderId(executor_providers[1])` -- necessarily `executor_providers[0]` in multi-loopr's fixed
+two-provider system -- confirmed identical in both the spec's prose and the shipped `plan.ts` code.
+This is architecture, not a domain figure requiring a citation in this section's sense (a threshold,
+statistic, or methodology number) -- no such figure appears in `plan.ts`.
 
-**Claude Code's `ultracode` effort value is deliberately excluded.** The vendor's published CLI
-reference additionally lists `ultracode` as an accepted `--effort` value, but `CLAUDE_EFFORT_VALUES`
-excludes it. Source: `docs/modernization_log.md` §1's own stated rule, quoted directly in
-`claude-code.ts`'s doc comment: "treat any value absent from the installed binary's own help as
-unavailable." This is a real, live judgment call a developer without this project's own history would
-not know to make -- the installed binary's actual `--help` output is treated as more authoritative than
-the vendor's own published docs page, on the theory that a doc page can describe an aspirational or
-not-yet-rolled-out feature.
+**The reviewer-diff truncation cap, `DIFF_CAP_CHARS = 20_000` in `src/dispatch/prompt.ts`.** This is an
+ordinary defensive-programming bound analogous to Phase 2's `MAX_REPORTED_EVENTS = 20`
+(`src/adapters/codex-cli.ts`) and Phase 1's SIGTERM-grace-period/recursion-depth constants, all
+previously treated in this project's own comprehension passes as engineering judgment calls rather than
+domain-derived figures requiring external citation -- consistent treatment continued here.
 
-**The `--setting-sources project` / `--allowedTools "Bash,Edit,Write,Read,Glob,Grep"` / `--model`
-flag-syntax verifications, closed during this phase's own build rather than left as spec-time guesses.**
-`PHASE_2_SPEC.md` §6.1 flagged four items `[UNVERIFIED-P2]`, requiring the executor to confirm each
-against the installed binary before shipping. `claude-code.ts`'s own file header states three were
-confirmed against `claude --help` v2.1.211 during implementation: `--setting-sources` accepts a
-comma-separated list of `user`/`project`/`local` (so the literal `"project"` is valid); `--allowedTools`
-accepts bare tool names; `--model <model>` exists as documented. This is a real methodology figure (a
-CLI's accepted flag syntax) grounded in a stated local binary probe -- **[VERIFIED-LOCAL]** by the
-implementation's own account; I did not independently re-run `claude --help` myself this run to
-re-confirm it, so this is inherited verification, not independently re-verified by me -- **[UNVERIFIED]**
-beyond that inherited chain.
-
-**The fourth `[UNVERIFIED-P2]` item -- whether `claude -p` with no positional prompt argument reads
-from stdin -- was the one genuinely left unclosed by the implementation commit, and was closed by the
-review itself with a live local smoke test.** See §5 below; this is both a domain-mechanics figure (a
-CLI's actual stdin-fallback behavior) and the subject of this phase's honesty-audit finding.
-
-No other domain figures (thresholds, statistics, or methodology numbers in the sense this section
-tracks) were introduced this phase. `MAX_REPORTED_EVENTS = 20` (`src/adapters/codex-cli.ts`) is an
-ordinary defensive-programming cap on how many matched failure events get attached to a thrown error's
-details, not a domain-derived figure, consistent with how Phase 1's own SIGTERM-grace-period and
-recursion-depth constants were treated in the prior comprehension pass.
+No domain figures (thresholds, statistics, or methodology numbers sourced from an external authority)
+were introduced this phase. Phase 3's genuinely new content is internal orchestration design (turn
+sequencing, retry policy, ground-truth reconciliation), which `PHASE_3_SPEC.md` §0 itself explicitly
+distinguishes from "external CLI-surface risk" and marks `[DECISION, Phase 3]` throughout rather than
+`[VERIFIED-LOCAL]`/`[VERIFIED-DOC]` -- these are multi-loopr's own considered design choices, not vendor
+facts requiring a citation or an [UNVERIFIED] marker in the sense this section tracks.
 
 ## 5. Honesty audit
 
-Compared every `PHASE_2_SPEC.md` clause I read against the shipped code, this run, including running
-`npm run typecheck`, the full test suite, `doctor --boundary`, and `doctor --providers --json` myself
-rather than trusting the spec's or the review's own claims about their results.
+Compared every `PHASE_3_SPEC.md` clause I read against the shipped code, this run, including running
+`npm run typecheck`, the full test suite via `npm run check`, and `node --test src/cli/run.test.ts` in
+isolation myself, rather than trusting the spec's or either review's own claims about their results.
 
-**Real gap, already found and closed within this same phase's own review cycle, worth naming precisely
-because of what it reveals about the project's own pattern:** `PHASE_2_SPEC.md` §6.1's fourth
-`[UNVERIFIED-P2]` item required confirming, before shipping, whether `claude -p` (no positional prompt
-argument) reads its prompt from stdin -- load-bearing because `buildInvocation`'s `stdin: req.prompt`
-design assumes exactly this. The Phase 2 implementation commit (`de97571`) closed the other three
-`[UNVERIFIED-P2]` items in `claude-code.ts`'s own file-header comment but silently omitted this fourth
-one -- the comment as first shipped did not document that it had been checked at all. This is exactly
-the same undocumented-verification-gap shape as Phase 1's Windows `exitCode:null` narrowing (an
-implementation detail was handled correctly in the running code but not written down where a future
-reader would look for it). Unlike the Phase 1 case, this one was caught and closed inside the *same*
-phase's review, before approval: the review-patch commit (`6298f98`) added a documented live smoke test
-(`echo "..." | claude -p --output-format json --effort low` on the installed v2.1.211 binary, returning
-a valid parsed JSON result) confirming the design was already functionally correct, and recorded that
-confirmation in the code's own comments. I confirmed this by reading `6298f98`'s diff directly: it
-touches exactly one file (`src/adapters/claude-code.ts`), adds only comment lines (13 insertions, 0
-production-logic changes), and the commit message states 152/152 tests still pass and the boundary scan
-still reports 0 violations -- both of which I independently re-ran this run and confirmed still hold at
-the current tip.
+**Real gap #1, disclosed by the phase's own review and now independently confirmed resolved by me: the
+auth-state-dependent test hazard in `src/cli/run.test.ts`.** Documented fully in §3 above. The review
+that approved Phase 3 named this precisely and chose, correctly, not to fix it itself (adding an
+injection seam to a spec-mandated function signature is a design decision, properly escalated rather
+than patched unilaterally). The architect directed the fix; I read commit `4588f9e`'s actual diff line
+by line (not the commit message) and independently ran the resulting tests. It is real and it works: the
+previously-hazardous test no longer depends on this machine's Codex-CLI auth state, and the CLI-level
+subprocess test that cannot accept dependency injection now forces a deterministic preflight failure by
+construction instead. This closes the one open item the Phase 3 review left on the record (see §6).
 
-**Not a gap, but the item I was specifically asked to verify rather than assume: whether the Phase 1
-Windows `exitCode:null` erratum was genuinely resolved before Phase 2 depended on it.** It was. Commit
-`dda755f` ("docs: erratum to PHASE_1_SPEC.md §6.1") added the erratum text to `PHASE_1_SPEC.md` §6.1
-itself at `2026-08-16 12:45:50`, chronologically before both the Phase 2 blueprint commit (`89966af`,
-`12:57:27`) and the Phase 2 implementation commit (`de97571`, `13:22:29`) -- confirmed by reading commit
-timestamps directly, not by trusting commit order in `git log`'s default listing alone. The erratum's
-own text (read this run, `PHASE_1_SPEC.md` lines 616-630) states the consequence for downstream phases
-in one explicit sentence: "code must not rely on `exitCode === null` as an OS-independent 'command not
-found' signal -- treat any non-zero `exitCode` as the actual failure signal instead." I then read both
-Phase 2 adapters' `interpretResult` implementations directly and confirmed both do exactly this:
-`claude-code.ts` line 144 and `codex-cli.ts` line 161 both branch on `raw.exitCode !== 0`, never on
-`=== null`. So this is not merely a paper resolution -- Phase 2's actual code demonstrably respects the
-erratum's guidance. This closes Phase 1 open item #1 (see §6).
+**Real gap #2, a genuine spec-vs-shipped-signature divergence, disclosed in the code's own comments but
+worth naming explicitly here because a third party diffing the spec's literal text against the code
+would find a real mismatch: `RunDispatchDeps`'s shape does not match `PHASE_3_SPEC.md` §6.5's literal
+text.** The spec's §6.5 code block declares exactly two optional fields (`adapters`, `runProcessFn`);
+the shipped `src/dispatch/run-loop.ts` declares three (`adapters`, `runProcessFn`, `preflightFn`). This
+is not an oversight -- `run-loop.ts`'s own doc comment names it as a deliberate autonomous-critique
+addition and states the reason (§3 above), and the reviewer's own approval commit shows independent
+awareness of the fix's shape ("the bounded retry is structurally scoped..." and the AC21 discussion both
+presuppose the injected `preflightFn` seam `run-loop.test.ts` actually uses). I confirm this reading is
+correct by direct inspection of both files. This is a disclosed, reasoned deviation, not an undisclosed
+one -- but it is still a real difference between what §6.5's code block states and what shipped, and the
+comprehension-pass discipline this project follows (documented in Phase 1's Windows erratum and Phase
+2's `[UNVERIFIED-P2]`-closure gap, both named in prior comprehension passes) is to name it plainly rather
+than let the spec's literal text stand uncorrected next to code that does something slightly different.
 
-**A documentation curiosity worth naming, though not a code-vs-spec gap:** `PHASE_2_SPEC.md` §9 item 15
-(written at `89966af`, `12:57:27` -- twelve minutes after the erratum commit) describes amending
-`PHASE_1_SPEC.md` itself as "a separate, still-pending operator decision this phase does not resolve or
-need to resolve," phrased as if the erratum had not yet happened. By the time that sentence was written,
-`dda755f` had already appended the erratum to `PHASE_1_SPEC.md` §6.1. This does not affect Phase 2's own
-correctness (the spec's conclusion -- "Phase 2 has no dependency on that open item being closed" -- is
-still true either way, since Phase 2's code was never written to depend on the null/non-null
-distinction), but the spec's own prose was already slightly stale relative to the repository's real
-state at the moment it was drafted. I flag this as a minor process observation, not a functional defect.
+**A minor, non-blocking observation, not named by either review: `RunHaltedError` (added this phase,
+`src/domain/errors.ts`) is never actually constructed anywhere in the shipped code.** `PHASE_3_SPEC.md`
+§1.4 justifies adding this class with "it is the first phase that needs a concrete class for... the run
+stopped because the dispatched agent said it could not, or should not, continue." I grepped the full
+`src/` tree and confirmed `RunHaltedError` appears in exactly one file, its own declaration in
+`errors.ts` -- `run-loop.ts` reports a halted run by returning a `RunResult` object with
+`exitCode: ExitCode.RUN_HALTED` set directly, never by constructing or throwing a `RunHaltedError`
+instance. This is consistent with `run-loop.ts`'s own explicit contract ("never throws a
+`MultiLooprError` for a modelled failure... returns the exit code"), so it is not a bug -- `exitCodeFor()`
+never needs to see this particular error class because `runDispatch` never throws it -- but it means the
+class exists for schema/type-hierarchy completeness (parity with every other exit code having a matching
+error class) rather than because any code path actually constructs one. Not a spec violation (nothing in
+§8's acceptance criteria requires `RunHaltedError` to be thrown, only that `RUN_HALTED`'s exit code
+behaviour work, which it does, tested), but worth naming as a small mismatch between the class's stated
+justification and its actual (non-)use.
 
-No other `PHASE_2_SPEC.md` clause I checked (§1's per-file additive/regression constraints, §2
-dependency exactness, §3's plain-`as const` schema-avoidance claim, §4's CLI-surface no-change claim,
-§6.1-§6.5 function signatures and flag lists, §7's failure-mode guard table, §8's 21 acceptance
-criteria I could check by direct execution or direct code reading, §9's non-goals) showed a divergence
-between what the spec states and what the code I read this run actually does.
+No other `PHASE_3_SPEC.md` clause I checked (§1's per-file additive/regression constraints, §2's
+no-new-dependency claim, §3's schema definitions, §4's CLI surface and exit-code table, §6.1-§6.7's
+function signatures and control flow, §7's failure-mode guard table, §8's 32 acceptance criteria I could
+check by direct execution or direct code reading, §9's non-goals) showed a divergence between what the
+spec states and what the code I read this run actually does.
 
 ## 6. Open items
 
-No open items are carried forward from the prior `COMPREHENSION.md`: its sole open item (#1, whether to
-formally amend `PHASE_1_SPEC.md` §6.1 for the Windows `exitCode:null` narrowing before Phase 2/3 code
-came to depend on the exact null/non-null distinction) is now resolved. It was resolved two ways,
-independently confirmed this run: (a) the spec itself was, in fact, formally amended (commit `dda755f`,
-before Phase 2 was drafted or implemented), and (b) Phase 2's own `interpretResult` code in both
-adapters demonstrably never keys on `exitCode === null`, only on `exitCode !== 0`, exactly as the
-erratum recommends. Neither half of that resolution is aspirational or merely documented -- both were
-verified by reading the actual files this run (see §5).
+No open items are carried forward from the prior `COMPREHENSION.md`: Phase 2's own open items (the
+version-drift caveat on the four `[UNVERIFIED-P2]` flag-syntax confirmations) concerned Phase 2's
+adapter-flag-syntax confirmations specifically, not anything Phase 3's code depends on differently, and
+Phase 3 introduces no new provider CLI flags (`PHASE_3_SPEC.md` §0: "this spec introduces very little
+genuinely new external CLI-surface risk... it reuses `buildInvocation`'s already-verified output
+verbatim") -- so that caveat still stands, unchanged, as a standing environmental note rather than a
+Phase 3 open item. It is restated here for completeness rather than silently dropped: the four
+`[UNVERIFIED-P2]` flag-syntax confirmations from Phase 2 remain tied to this machine's specific
+`claude` 2.1.211 / `codex-cli` 0.128.0 versions; if either CLI is upgraded, those confirmations should be
+treated as needing re-verification, not as permanently settled.
 
-No new open items surfaced from this phase's own review commits (`de97571`, `6298f98`, `d8785b6` --
-the latter carries no commit body, unlike Phase 1's approval commit, so its findings live entirely in
-the preceding fix-patch commit's own message, which I read and summarized in §5) beyond the one gap
-already closed within the same review cycle (§5).
+The one item this phase's own review (`a5a4567`) placed on the record as unresolved -- the
+auth-state-dependent test hazard in `src/cli/run.test.ts` -- is now resolved, not carried forward. See
+§3 and §5 above for the full account: commit `4588f9e`, directed by the architect after approval,
+verified by me this run against the actual diff and by independently re-running the affected tests.
 
-One forward-looking note, not an unresolved item but worth stating plainly for the operator: the four
-`[UNVERIFIED-P2]` flag-syntax items `PHASE_2_SPEC.md` §6.1 named were closed by a local binary probe on
-this specific machine's installed CLI versions (`claude` 2.1.211, `codex-cli` 0.128.0). If either CLI is
-upgraded before Phase 3 begins, these flag-syntax confirmations should be treated as tied to those
-specific versions, not as permanently settled -- this is the same version-drift concern PRD FM9 already
-tracks for version *ranges*, extended here to flag *syntax*, which FM9's mechanism does not separately
-guard.
+One new item surfaces from this run's own honesty audit, not previously flagged by either review: the
+minor `RunHaltedError`-never-constructed observation in §5. It does not block anything and is not a
+correctness defect, but is worth a future phase's attention if `run-loop.ts` is ever refactored toward
+throwing `MultiLooprError` subclasses more uniformly (it currently deliberately does not, by its own
+stated design) -- at that point, either construct `RunHaltedError` for real or reconsider whether the
+class needs to exist at all.
+
+One forward-looking note, not an unresolved item but worth stating plainly for the operator: Phase 3's
+own explicit non-goals (`PHASE_3_SPEC.md` §9) mean multi-loopr still cannot loop across loopr phases on
+its own, still produces no real `PHASE_(N+1)_SPEC.md` content from its reviewer turn, and still collects
+no AC1-AC3 evidence -- all three remain deferred to Phase 4/5 as planned, not accidentally dropped.
 
 ## Phase Log
 
@@ -302,7 +366,7 @@ first value of type `AdapterRegistry`) and a shared, provider-agnostic conforman
 (`assertAdapterConformance`) both adapters' own test files call against themselves. Each adapter builds
 a pure `Invocation` (argv/env/cwd/stdin) for its CLI, maps `ModelTier` to that provider's own effort
 value, delegates health checks to a newly-extracted `buildProviderPreflightReport()` (lifted out of
-Phase 1's `runPreflight()` without changing its observable behavior, confirmed by Phase 1's own
+Phase 1's `runPreflight()` without changing its observable behaviour, confirmed by Phase 1's own
 unmodified preflight tests still passing), and interprets a completed process result into a strict,
 ordered `TurnOutcome` verdict (timeout checked first and unconditionally, then a provider-specific
 failure-event/exit-code check, then success) -- never by asking the provider to self-report success.
@@ -320,3 +384,28 @@ still-open item, this one was found and closed within the same review cycle via 
 item #1 (the Windows `exitCode:null` erratum) is now resolved: the spec was formally amended
 (`dda755f`, before this phase was drafted) and this phase's own `interpretResult` code in both adapters
 demonstrably keys on `exitCode !== 0` rather than `=== null`, matching the erratum's guidance exactly.
+
+**Phase 3 -- 2026-08-16.** Sequential dispatch engine. Shipped the first code in this project that
+actually spawns a provider CLI to do real work: `src/dispatch/` (`plan.ts`, `prompt.ts`, `record.ts`,
+`turn.ts`, `run-loop.ts`) and `src/cli/run.ts`, wired into `main.ts` as a new `run` command.
+`planTurnSequence` resolves PRD §6.3's DECISION into a fixed three-slot sequence (executor, executor,
+reviewer); `runTurn` spawns one turn end to end and, critically, discards the agent's own self-reported
+`repo`/`spec_ref`/artifact hashes in favour of independently-computed git and file-hash ground truth
+(PRD §7 I2) before ever persisting or trusting the record; `runDispatch` wraps the whole sequence in the
+Phase 1 run lock, gates every consecutive pair of completed turns through Phase 1's unmodified
+`verifyContinuation()`, and grants exactly one bounded retry scoped only to a non-`CONTINUED` verdict --
+every other failure class halts on first occurrence with zero retry. Four Phase 1/2 files
+(`src/domain/run.ts`, `src/domain/errors.ts`, `src/util/paths.ts`, `src/verify/git.ts`) plus
+`src/cli/main.ts` were modified, each confirmed additive per this phase's own file-manifest claims. The
+phase's own adversarial review (commit `a5a4567`) found and closed two test-coverage gaps against
+explicit acceptance criteria (lock-release-on-unexpected-throw, retry-scoping for two more failure
+classes) via a fix-patch commit (`0434f98`, no production-code change) before approving, and separately
+flagged -- explicitly, without fixing it -- a real but non-blocking risk: two `src/cli/run.test.ts`
+tests were only safe from accidentally dispatching a real provider-CLI turn because of this specific
+development machine's current Codex-CLI-unauthenticated state, not because the code structurally
+prevented it. After approval, the architect directed a follow-up fix (commit `4588f9e`) adding an
+injectable `deps?: RunDispatchDeps` parameter to `runRunCommand`, mirroring the injection seam
+`runDispatch` itself already had one layer down; this closes the gap for real (verified independently
+this run against the actual diff and by re-running the affected tests: 196/196 overall, all 10 of
+`run.test.ts`'s own tests passing in isolation) while leaving `src/cli/main.ts`'s real call site --
+which never passes `deps` -- byte-identical to before the parameter existed.
