@@ -9,6 +9,19 @@
 // names (its own help text shows "Bash(git *) Edit", i.e. bare names mixed with pattern-restricted
 // ones); `--model <model>` exists as documented. `--bare` is never emitted, under any input (PRD
 // §9 FM8).
+//
+// [UNVERIFIED-P2] closure, added at Step 12 review (approved commit chore: Phase 2 review
+// approved): §6.1's fourth flagged item -- whether `claude -p` (no positional prompt argument)
+// reads the prompt from stdin, as `stdin: req.prompt` below assumes -- was left unaddressed by
+// the phase-2 implementation commit's own comments; `claude --help` alone does not settle it (its
+// `[prompt]` argument description says only "Your prompt", with no stdin-fallback note). The
+// review closed the gap with a live local smoke test rather than trusting the design silently:
+// `echo "Reply with exactly the word OK and nothing else." | claude -p --output-format json
+// --effort low` on the installed v2.1.211 binary returned `{"type":"result",...,"result":"OK",...}`
+// -- confirming `-p` with no positional argument does read the prompt from stdin. [VERIFIED-LOCAL].
+// This is the exact class of gap PHASE_1_SPEC.md's own Windows `exitCode:null` erratum (see
+// COMPREHENSION.md §5-6) already showed this project shipping silently once; recorded here instead
+// of left implicit so a future reader does not have to re-derive it.
 
 import { InternalError, TurnTimeoutError } from "../domain/errors.ts";
 import type { ModelTier } from "../domain/tiers.ts";
