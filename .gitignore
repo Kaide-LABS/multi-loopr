@@ -2,3 +2,9 @@ node_modules/
 .multi-loopr/
 *.log
 .loopr-state/
+
+# Internal build-process documents for multi-loopr's own construction (via loopr) -- not part of
+# the shipped tool. Untracked going forward; still present in earlier commit history.
+PHASE_*_SPEC.md
+multi-loopr-PRD.md
+COMPREHENSION.md
