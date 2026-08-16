@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Local, headless harness that runs loopr's spec discipline across Claude Code and Codex CLI.",
   "type": "module",
-  "private": true,
   "license": "MIT",
   "bin": {
     "multi-loopr": "./src/cli/main.ts"
@@ -11,7 +10,7 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": ["src", "!src/**/*.test.ts", "README.md", "LICENSE"],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"src/**/*.test.ts\"",
