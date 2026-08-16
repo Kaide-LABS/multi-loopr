@@ -13,6 +13,8 @@ import type { DoctorOptions, DoctorReport } from "./doctor.ts";
 import { runDoctor } from "./doctor.ts";
 import type { RunCommandOptions, RunReport } from "./run.ts";
 import { runRunCommand } from "./run.ts";
+import type { EvidenceCommandOptions, EvidenceReport } from "./evidence.ts";
+import { runEvidenceCommand } from "./evidence.ts";
 
 const USAGE_TEXT = `Usage: multi-loopr <command> [options]
 
@@ -24,13 +26,17 @@ Commands:
   multi-loopr doctor --boundary [--json]     Boundary scan only (fast, no provider probes).
   multi-loopr doctor --providers [--json]    Provider preflight only.
   multi-loopr run --config <path> [--json]   Dispatch one loopr phase's turn sequence.
+  multi-loopr evidence --repo-dir <path> --run-id <uuid> [--final-phase] [--json]
+                                              Re-derive AC1/AC2/AC3 evidence for a completed run
+                                              from its persisted handoff records.
 `;
 
 type Command =
   | { readonly kind: "version" }
   | { readonly kind: "help" }
   | ({ readonly kind: "doctor" } & DoctorOptions)
-  | ({ readonly kind: "run" } & RunCommandOptions);
+  | ({ readonly kind: "run" } & RunCommandOptions)
+  | ({ readonly kind: "evidence" } & EvidenceCommandOptions);
 
 function parseDoctorArgs(rest: readonly string[]): Command {
   let json = false;
@@ -90,6 +96,53 @@ function parseRunArgs(rest: readonly string[]): Command {
   return { kind: "run", json, configPath };
 }
 
+/**
+ * Parses `evidence`'s flags: `--repo-dir <path>` and `--run-id <uuid>` (each consumes the next argv
+ * element; missing value or missing flag entirely -> `UsageError`), plus the boolean presence flags
+ * `--final-phase` (absent means `false`, mirroring `RunConfig.is_final_phase`'s own default) and
+ * `--json`. Any other flag -> `UsageError` -- unknown flags are never ignored, the same rule every
+ * prior CLI surface in this project already enforces. Implements PHASE_5_SPEC.md §6.4.
+ */
+function parseEvidenceArgs(rest: readonly string[]): Command {
+  let repoDir: string | null = null;
+  let runId: string | null = null;
+  let finalPhase = false;
+  let json = false;
+
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--repo-dir") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        throw new UsageError("evidence --repo-dir requires a path argument.", { flag: "--repo-dir" });
+      }
+      repoDir = value;
+      i += 1;
+    } else if (arg === "--run-id") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        throw new UsageError("evidence --run-id requires a uuid argument.", { flag: "--run-id" });
+      }
+      runId = value;
+      i += 1;
+    } else if (arg === "--final-phase") {
+      finalPhase = true;
+    } else if (arg === "--json") {
+      json = true;
+    } else {
+      throw new UsageError(`Unknown flag for evidence: ${String(arg)}`, { flag: arg });
+    }
+  }
+
+  if (repoDir === null) {
+    throw new UsageError("evidence requires --repo-dir <path>.", { flag: "--repo-dir" });
+  }
+  if (runId === null) {
+    throw new UsageError("evidence requires --run-id <uuid>.", { flag: "--run-id" });
+  }
+  return { kind: "evidence", repoDir, runId, finalPhase, json };
+}
+
 /** Parses `argv` (the full `process.argv`-shaped array; `argv.slice(2)` is the user's own args). */
 function parseArgs(argv: readonly string[]): Command {
   const args = argv.slice(2);
@@ -110,6 +163,9 @@ function parseArgs(argv: readonly string[]): Command {
   }
   if (first === "run") {
     return parseRunArgs(args.slice(1));
+  }
+  if (first === "evidence") {
+    return parseEvidenceArgs(args.slice(1));
   }
 
   throw new UsageError(`Unknown command: ${args.join(" ")}`, { argv: args });
@@ -174,6 +230,26 @@ function renderRunHumanReport(report: RunReport): string {
   return lines.join("\n") + "\n";
 }
 
+function renderEvidenceHumanReport(report: EvidenceReport): string {
+  const lines: string[] = [];
+  lines.push(
+    `multi-loopr evidence -- ${report.ok ? "OK" : "ACCEPTANCE INCOMPLETE"} (run ${report.run_id}, ` +
+      `${String(report.turns_found)} turn(s) found, generated ${report.generated_at})`,
+  );
+  lines.push("");
+  lines.push(`AC1 (cross-provider continuity): ${report.ac1.satisfied ? "satisfied" : "not satisfied"} -- ${report.ac1.detail}`);
+  lines.push(`AC2 (clean, non-interactive completion): ${report.ac2.satisfied ? "satisfied" : "not satisfied"} -- ${report.ac2.detail}`);
+  lines.push(`AC3 (artifact reference and production): ${report.ac3.satisfied ? "satisfied" : "not satisfied"} -- ${report.ac3.detail}`);
+  if (report.problems.length > 0) {
+    lines.push("");
+    lines.push("Problems:");
+    for (const problem of report.problems) {
+      lines.push(`  - ${problem}`);
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
 /** Parses `argv`, dispatches the requested command, and returns the process exit code. Never calls `process.exit`. */
 export async function main(argv: readonly string[]): Promise<number> {
   try {
@@ -195,6 +271,16 @@ export async function main(argv: readonly string[]): Promise<number> {
       case "run": {
         const { report, exitCode } = await runRunCommand({ configPath: command.configPath, json: command.json });
         process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderRunHumanReport(report));
+        return exitCode;
+      }
+      case "evidence": {
+        const { report, exitCode } = await runEvidenceCommand({
+          repoDir: command.repoDir,
+          runId: command.runId,
+          finalPhase: command.finalPhase,
+          json: command.json,
+        });
+        process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderEvidenceHumanReport(report));
         return exitCode;
       }
     }

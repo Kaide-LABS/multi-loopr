@@ -23,6 +23,7 @@ export const ExitCode = {
   TURN_TIMEOUT: 10,
   RUN_HALTED: 11,
   LOOPR_ARTIFACT_BYPASSED: 12,
+  ACCEPTANCE_INCOMPLETE: 13,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */

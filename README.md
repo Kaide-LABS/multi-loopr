@@ -9,6 +9,17 @@ to the other so the second genuinely continues the first's work.
 A `multi-loopr run --config <path>` command dispatches one loopr phase's sequential turn sequence.
 `run` mechanically enforces that every turn genuinely references loopr's own `baby_prd.md`/
 `context.md`/phase spec, and that the reviewer turn genuinely produces the next loopr artifact.
+`multi-loopr evidence --repo-dir <path> --run-id <uuid>` independently re-derives PRD AC1 (continuity),
+AC2 (clean completion), and AC3 (artifact reference and production) from a completed run's own
+persisted handoff records, offline and without trusting anything the run itself reported live.
+
+## Examples
+
+`examples/toy-build/` is a small, real, two-file Node.js CLI build (`wordcount.mjs`) with its own
+loopr artifacts, meant to be driven end to end through `multi-loopr run` then `multi-loopr evidence`
+as a live demonstration of the full cross-provider handoff. See `examples/toy-build/README.md` for
+the exact, copy-pasteable procedure. This README makes no claim that a live toy-build run has been
+performed on any particular machine; whether one has is recorded in `COMPREHENSION.md`.
 
 ## Requirements
 
