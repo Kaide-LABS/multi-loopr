@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { BoundaryViolationError, InternalError, TurnTimeoutError } from "../domain/errors.ts";
+import { BoundaryViolationError, InternalError, LooprArtifactBypassError, TurnTimeoutError } from "../domain/errors.ts";
 import type { FileRef, HaltSignal, HandoffRecord } from "../domain/relay.ts";
 import { writeHandoffRecord } from "../domain/relay.ts";
 import type { ProviderId, RawInvocationResult, RunConfig, TurnOutcome, TurnRequest } from "../domain/run.ts";
@@ -16,7 +16,9 @@ import type { AdapterRegistry, Invocation, PreflightReport, ProviderAdapter } fr
 import { runProcess } from "../util/exec.ts";
 import { acquireRunLock, readRunLock, releaseRunLock } from "../util/lock.ts";
 import { handoffPath } from "../util/paths.ts";
+import { sha256File } from "../util/hash.ts";
 import type { PreflightSummary } from "../verify/preflight.ts";
+import { nextPhaseSpecPath } from "./artifacts.ts";
 import { runDispatch } from "./run-loop.ts";
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -79,6 +81,8 @@ async function freshRepoWithSpec(): Promise<string> {
   const dir = await mkdtemp(`${tmpdir()}/multi-loopr-run-loop-test-`);
   await initRepo(dir);
   await commitFile(dir, "PHASE_1_SPEC.md", "spec content\n", "add spec");
+  await commitFile(dir, "baby_prd.md", "baby prd content\n", "add baby_prd.md");
+  await commitFile(dir, "context.md", "context content\n", "add context.md");
   // Pre-exists so a later "revert" scenario reverts to a real recorded blob (not to
   // non-existence, which C3_NO_REVERT does not treat as a revert target).
   await commitFile(dir, "foo.txt", "v0\n", "add foo.txt");
@@ -94,7 +98,24 @@ function baseConfig(dir: string, overrides: Partial<RunConfig> = {}): RunConfig 
     turn_timeout_ms: 1_800_000,
     phase: 1,
     spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+    is_final_phase: false,
     ...overrides,
+  };
+}
+
+/**
+ * `FileRef`s for `freshRepoWithSpec()`'s own `baby_prd.md`/`context.md`/`PHASE_1_SPEC.md`, computed
+ * from the real files on disk -- required in every turn's `artifacts_read` since Phase 4's
+ * `assertLooprArtifactsReferenced()` now runs unconditionally, for every turn (PHASE_4_SPEC.md
+ * §6.3).
+ */
+async function looprArtifactRefs(dir: string): Promise<{ babyPrd: FileRef; context: FileRef; spec: FileRef }> {
+  return {
+    babyPrd: { path: "baby_prd.md", sha256: await sha256File(`${dir}/baby_prd.md`) },
+    context: { path: "context.md", sha256: await sha256File(`${dir}/context.md`) },
+    spec: { path: "PHASE_1_SPEC.md", sha256: await sha256File(`${dir}/PHASE_1_SPEC.md`) },
   };
 }
 
@@ -179,6 +200,7 @@ test("runDispatch: clean 3-turn run completes ok, honours model_overrides/timeou
     const claude = new RecordingFakeAdapter("claude-code");
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
 
     let call = 0;
     const runProcessFn: typeof runProcess = async () => {
@@ -188,22 +210,32 @@ test("runDispatch: clean 3-turn run completes ok, honours model_overrides/timeou
         await commitFile(dir, "foo.txt", "v1\n", "turn0");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-          draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
         );
       } else if (step === 1) {
         await commitFile(dir, "bar.txt", "v1\n", "turn1");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
           draft({
-            artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
             artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
           }),
         );
       } else {
-        await commitFile(dir, "reviewed.txt", "v1\n", "turn2");
+        // The reviewer turn's Phase 4 responsibility: genuinely produce PHASE_2_SPEC.md (phase: 1,
+        // is_final_phase: false) as part of this turn's own commit.
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 2, "reviewer", "claude-code"),
-          draft({ role: "reviewer", artifactsRead: [{ path: "bar.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
         );
       }
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
@@ -245,6 +277,7 @@ test("runDispatch: a continuity failure retries exactly once and succeeds", asyn
     const claude = new RecordingFakeAdapter("claude-code");
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
 
     let call = 0;
     const runProcessFn: typeof runProcess = async () => {
@@ -254,14 +287,17 @@ test("runDispatch: a continuity failure retries exactly once and succeeds", asyn
         await commitFile(dir, "foo.txt", "v1\n", "turn0");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-          draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
         );
       } else if (step === 1) {
         // Bad attempt: reverts foo.txt entirely -> C3_NO_REVERT fails all-reverted -> REDO.
         await commitFile(dir, "foo.txt", "v0\n", "turn1 (bad, reverts turn0)");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
-          draft({ artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
         );
       } else if (step === 2) {
         // Retry (turnIndex 2): restores foo.txt to turn0's content (undoing the bad revert) and
@@ -270,15 +306,20 @@ test("runDispatch: a continuity failure retries exactly once and succeeds", asyn
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 2, "executor", "codex-cli"),
           draft({
-            artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
             artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
           }),
         );
       } else {
-        await commitFile(dir, "reviewed.txt", "v1\n", "turn2 (reviewer, turnIndex 3)");
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2 (reviewer, turnIndex 3)");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 3, "reviewer", "claude-code"),
-          draft({ role: "reviewer", artifactsRead: [{ path: "bar.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
         );
       }
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
@@ -315,6 +356,7 @@ test("runDispatch: a continuity failure on both the original and the retry halts
     const claude = new RecordingFakeAdapter("claude-code");
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
 
     let call = 0;
     const runProcessFn: typeof runProcess = async () => {
@@ -324,14 +366,17 @@ test("runDispatch: a continuity failure on both the original and the retry halts
         await commitFile(dir, "foo.txt", "v1\n", "turn0");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-          draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
         );
       } else if (step === 1) {
         // Original attempt (turnIndex 1) reverts foo.txt back to turn0's own pre-turn content.
         await commitFile(dir, "foo.txt", "v0\n", "turn1 attempt 1 (bad, reverts turn0)");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, step, "executor", "codex-cli"),
-          draft({ artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
         );
       } else {
         // Retry (turnIndex 2): never touches foo.txt again, so it stays reverted relative to
@@ -340,7 +385,7 @@ test("runDispatch: a continuity failure on both the original and the retry halts
         await commitFile(dir, `noise-${String(step)}.txt`, "noise\n", `turn1 attempt ${String(step)} (bad, still reverted)`);
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, step, "executor", "codex-cli"),
-          draft({ artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
         );
       }
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
@@ -373,12 +418,17 @@ test("runDispatch: a HandoffRecord.status of \"halted\" stops the run immediatel
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
     const haltSignal: HaltSignal = { code: "BLOCKED_ON_HUMAN", message: "need operator input" };
+    const artifacts = await looprArtifactRefs(dir);
 
     const runProcessFn: typeof runProcess = async () => {
       await commitFile(dir, "foo.txt", "v1\n", "turn0 (halted)");
       await writeHandoffRecord(
         handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-        draft({ status: "halted", halt: haltSignal }),
+        draft({
+          status: "halted",
+          halt: haltSignal,
+          artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+        }),
       );
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
     };
@@ -441,14 +491,20 @@ test("runDispatch: an unexpected throw (BoundaryViolationError from assertNeutra
     const claude = new RecordingFakeAdapter("claude-code");
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
 
     const runProcessFn: typeof runProcess = async () => {
       // A commit carrying an AI-attribution trailer -- assertNeutralCommits (called inside
-      // runTurn, after ground-truth reconciliation) must reject this with BoundaryViolationError.
+      // runTurn, after ground-truth reconciliation and after both new Phase 4 artifact guards)
+      // must reject this with BoundaryViolationError. artifacts_read references all three loopr
+      // artifacts so this turn clears the new guards and reaches assertNeutralCommits at all.
       await commitFile(dir, "foo.txt", "v1\n", "turn0 (dirty)\n\nCo-Authored-By: Claude <noreply@anthropic.com>");
       await writeHandoffRecord(
         handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-        draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+        draft({
+          artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+          artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+        }),
       );
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
     };
@@ -518,6 +574,165 @@ test("runDispatch: a missing spec_path fails preflight (exitCode 3) before acqui
     assert.equal(calls, 0);
     assert.equal(await readRunLock(dir), null);
     assert.ok(result.problems.some((p) => p.includes("DOES_NOT_EXIST.md")));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// PHASE_4_SPEC.md §6.4 -- extended preflight for baby_prd_path/context_path, and the two new
+// loopr-artifact guards' end-to-end wiring through runDispatch (§8 acceptance criteria #20, #21, #23)
+// -------------------------------------------------------------------------------------------
+
+test("runDispatch: a missing baby_prd_path fails preflight (exitCode 3) before acquiring the lock or dispatching any turn", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { baby_prd_path: "DOES_NOT_EXIST_BABY_PRD.md" });
+    const adapters: AdapterRegistry = {
+      "claude-code": new RecordingFakeAdapter("claude-code"),
+      "codex-cli": new RecordingFakeAdapter("codex-cli"),
+    };
+
+    let calls = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      calls += 1;
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 3);
+    assert.deepStrictEqual(result.turns, []);
+    assert.equal(calls, 0);
+    assert.equal(await readRunLock(dir), null);
+    assert.ok(result.problems.some((p) => p.includes("DOES_NOT_EXIST_BABY_PRD.md")));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: a missing context_path fails preflight (exitCode 3) before acquiring the lock or dispatching any turn", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { context_path: "DOES_NOT_EXIST_CONTEXT.md" });
+    const adapters: AdapterRegistry = {
+      "claude-code": new RecordingFakeAdapter("claude-code"),
+      "codex-cli": new RecordingFakeAdapter("codex-cli"),
+    };
+
+    let calls = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      calls += 1;
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 3);
+    assert.deepStrictEqual(result.turns, []);
+    assert.equal(calls, 0);
+    assert.equal(await readRunLock(dir), null);
+    assert.ok(result.problems.some((p) => p.includes("DOES_NOT_EXIST_CONTEXT.md")));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: is_final_phase: true computes and enforces BUILD_COMPLETE.md as the reviewer's expected artifact path, instead of a PHASE_N_SPEC.md pattern", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { is_final_phase: true });
+    assert.equal(nextPhaseSpecPath(config.spec_path, config.phase, config.is_final_phase), "BUILD_COMPLETE.md");
+
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        // The reviewer turn's own final-phase responsibility: genuinely produce BUILD_COMPLETE.md,
+        // never a PHASE_N_SPEC.md-shaped path.
+        await commitFile(dir, "BUILD_COMPLETE.md", "build complete\n", "turn2 (final-phase reviewer)");
+        const completeSha256 = await sha256File(`${dir}/BUILD_COMPLETE.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "claude-code"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "BUILD_COMPLETE.md", sha256: completeSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.turns.length, 3);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: a LooprArtifactBypassError on the first turn propagates uncaught with zero retry -- the run halts at exit 12 on the very first occurrence, still releasing the lock", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir);
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+
+    let calls = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      calls += 1;
+      // Real commit, but the draft never references any loopr artifact in artifacts_read.
+      await commitFile(dir, "foo.txt", "v1\n", "turn0");
+      await writeHandoffRecord(
+        handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+        draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    await assert.rejects(
+      runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight }),
+      (err: unknown) => {
+        assert.ok(err instanceof LooprArtifactBypassError);
+        assert.equal(err.exitCode, 12);
+        return true;
+      },
+    );
+
+    // Zero retry: runProcessFn was invoked exactly once, joining the same zero-retry bucket as
+    // BoundaryViolationError/PreflightError/LockHeldError (PHASE_4_SPEC.md §7).
+    assert.equal(calls, 1);
+    assert.equal(await readRunLock(dir), null);
   } finally {
     await cleanup(dir);
   }

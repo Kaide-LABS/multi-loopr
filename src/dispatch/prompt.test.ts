@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { FORBIDDEN_RELAY_KEY_PATTERN } from "../domain/relay.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
 import {
+  buildArtifactProductionInstructions,
   buildExecutorPrompt,
   buildHandoffContext,
   buildProtocolInstructions,
@@ -62,6 +63,8 @@ test("buildProtocolInstructions contains every mandatory-content item, tested in
     handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",
     role: "executor",
     specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
   });
 
   // 1. the literal handoffAbsPath
@@ -82,6 +85,10 @@ test("buildProtocolInstructions contains every mandatory-content item, tested in
   assert.ok(out.includes('"completed"'));
   // 6. the literal specRepoRelPath
   assert.ok(out.includes("PHASE_2_SPEC.md"));
+  // 7. the literal babyPrdRepoRelPath (PHASE_4_SPEC.md §6.2, new)
+  assert.ok(out.includes(".claude/loopr/baby_prd.md"));
+  // 8. the literal contextRepoRelPath (PHASE_4_SPEC.md §6.2, new)
+  assert.ok(out.includes(".claude/loopr/context.md"));
 });
 
 test("buildHandoffContext renders only the allow-listed fields, never a raw JSON dump", () => {
@@ -99,11 +106,16 @@ test("buildHandoffContext renders only the allow-listed fields, never a raw JSON
   assert.ok(!out.includes("model_tier"));
 });
 
+const BABY_PRD_REPO_REL_PATH = ".claude/loopr/baby_prd.md";
+const CONTEXT_REPO_REL_PATH = ".claude/loopr/context.md";
+
 test("buildExecutorPrompt omits handoff context on the first turn (priorRecord: null) and includes it on the second", () => {
   const first = buildExecutorPrompt({
     role: "executor",
     specRepoRelPath: "PHASE_1_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: null,
     retryNote: null,
   });
@@ -113,6 +125,8 @@ test("buildExecutorPrompt omits handoff context on the first turn (priorRecord: 
     role: "executor",
     specRepoRelPath: "PHASE_1_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: priorRecord(),
     retryNote: null,
   });
@@ -124,6 +138,8 @@ test("buildExecutorPrompt appends retryNote when non-null", () => {
     role: "executor",
     specRepoRelPath: "PHASE_1_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: null,
     retryNote: "RETRY: fix C3_NO_REVERT.",
   });
@@ -135,8 +151,12 @@ test("buildReviewerPrompt contains the spec path, the real diff text, and the pr
   const out = buildReviewerPrompt({
     specRepoRelPath: "PHASE_2_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: priorRecord(),
     diff,
+    expectedArtifactPath: "PHASE_3_SPEC.md",
+    isFinalPhase: false,
     retryNote: null,
   });
   assert.ok(out.includes("PHASE_2_SPEC.md"));
@@ -162,8 +182,12 @@ test("buildReviewerPrompt truncates a very large diff rather than embedding it u
   const out = buildReviewerPrompt({
     specRepoRelPath: "PHASE_1_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: priorRecord(),
     diff: hugeDiff,
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
     retryNote: null,
   });
   assert.ok(out.length < hugeDiff.length);
@@ -174,9 +198,89 @@ test("buildReviewerPrompt appends retryNote when non-null", () => {
   const out = buildReviewerPrompt({
     specRepoRelPath: "PHASE_1_SPEC.md",
     handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
     priorRecord: priorRecord(),
     diff: "diff",
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
     retryNote: "RETRY: address C4_SPEC_CONTINUITY.",
   });
   assert.ok(out.includes("RETRY: address C4_SPEC_CONTINUITY."));
+});
+
+// -------------------------------------------------------------------------------------------
+// PHASE_4_SPEC.md §6.2 -- buildArtifactProductionInstructions() and its reviewer-only wiring
+// (§8 acceptance criteria #25, #26)
+// -------------------------------------------------------------------------------------------
+
+test("buildArtifactProductionInstructions contains the literal expectedArtifactPath and branches on isFinalPhase", () => {
+  const nonFinal = buildArtifactProductionInstructions("PHASE_5_SPEC.md", false);
+  assert.ok(nonFinal.includes("PHASE_5_SPEC.md"));
+  assert.ok(nonFinal.includes("technical blueprint"));
+  assert.ok(!nonFinal.includes("completion record"));
+
+  const final = buildArtifactProductionInstructions("BUILD_COMPLETE.md", true);
+  assert.ok(final.includes("BUILD_COMPLETE.md"));
+  assert.ok(final.includes("completion record"));
+  assert.ok(!final.includes("technical blueprint"));
+});
+
+test("buildReviewerPrompt's output contains the literal expectedArtifactPath and the isFinalPhase-branched framing, for both branches", () => {
+  const nonFinal = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_4_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "PHASE_5_SPEC.md",
+    isFinalPhase: false,
+    retryNote: null,
+  });
+  assert.ok(nonFinal.includes("PHASE_5_SPEC.md"));
+  assert.ok(nonFinal.includes("technical blueprint"));
+
+  const final = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_5_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "BUILD_COMPLETE.md",
+    isFinalPhase: true,
+    retryNote: null,
+  });
+  assert.ok(final.includes("BUILD_COMPLETE.md"));
+  assert.ok(final.includes("completion record"));
+});
+
+test("buildExecutorPrompt's output never contains buildArtifactProductionInstructions()'s output -- production instructions are reviewer-only", () => {
+  const expectedArtifactPath = "PHASE_5_SPEC.md";
+  const executorOut = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_4_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    retryNote: null,
+  });
+  const reviewerOut = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_4_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath,
+    isFinalPhase: false,
+    retryNote: null,
+  });
+
+  const productionInstructions = buildArtifactProductionInstructions(expectedArtifactPath, false);
+  assert.ok(reviewerOut.includes(productionInstructions));
+  assert.ok(!executorOut.includes(productionInstructions));
+  assert.ok(!executorOut.includes("You must genuinely produce loopr's next phase artifact"));
 });

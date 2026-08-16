@@ -7,6 +7,8 @@ operator's own machine, and hands a loopr-disciplined build phase off from one p
 to the other so the second genuinely continues the first's work.
 
 A `multi-loopr run --config <path>` command dispatches one loopr phase's sequential turn sequence.
+`run` mechanically enforces that every turn genuinely references loopr's own `baby_prd.md`/
+`context.md`/phase spec, and that the reviewer turn genuinely produces the next loopr artifact.
 
 ## Requirements
 

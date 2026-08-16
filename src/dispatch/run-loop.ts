@@ -7,7 +7,10 @@
 // `BoundaryViolationError` from `assertNeutralCommits` inside `runTurn`, which is deliberately
 // never caught anywhere in this module (I4 is a hard invariant, never retried) -- is allowed to
 // propagate normally, to be caught by `src/cli/run.ts`/`main.ts`'s existing generic catch, same as
-// any other module in this codebase.
+// any other module in this codebase. Phase 4 (PHASE_4_SPEC.md §9 item 3) adds a second such
+// uncaught-throw error class, `LooprArtifactBypassError`, raised from inside `runTurn` by
+// `assertLooprArtifactsReferenced()`/`assertNextPhaseSpecProduced()` and treated identically --
+// this module still never constructs `RunHaltedError`, and this phase gives no new reason to.
 
 import type { AdapterRegistry, ProviderAdapter } from "../ports/provider-adapter.ts";
 import { ADAPTER_REGISTRY } from "../adapters/registry.ts";
@@ -23,6 +26,7 @@ import { acquireRunLock, releaseRunLock } from "../util/lock.ts";
 import { handoffPath, repoRelToAbs } from "../util/paths.ts";
 import { sha256File } from "../util/hash.ts";
 import { runProcess } from "../util/exec.ts";
+import { nextPhaseSpecPath } from "./artifacts.ts";
 import type { TurnPlan } from "./plan.ts";
 import { planTurnSequence } from "./plan.ts";
 import { buildExecutorPrompt, buildReviewerPrompt } from "./prompt.ts";
@@ -98,8 +102,16 @@ interface BuildPromptInput {
   readonly slot: TurnPlan;
   readonly specRepoRelPath: string;
   readonly handoffAbsPath: string;
+  /** Repo-relative path to loopr's `baby_prd.md` for this build (PHASE_4_SPEC.md §6.4, new). */
+  readonly babyPrdRepoRelPath: string;
+  /** Repo-relative path to loopr's `context.md` for this build (PHASE_4_SPEC.md §6.4, new). */
+  readonly contextRepoRelPath: string;
   readonly prevRecord: HandoffRecord | null;
   readonly diff: string | null;
+  /** The reviewer's expected next-artifact path; unused for an executor slot (PHASE_4_SPEC.md §6.4, new). */
+  readonly nextArtifactPath: string;
+  /** `RunConfig.is_final_phase`; unused for an executor slot (PHASE_4_SPEC.md §6.4, new). */
+  readonly isFinalPhase: boolean;
   readonly retryNote: string | null;
 }
 
@@ -109,6 +121,8 @@ function buildPromptForSlot(input: BuildPromptInput): string {
       role: "executor",
       specRepoRelPath: input.specRepoRelPath,
       handoffAbsPath: input.handoffAbsPath,
+      babyPrdRepoRelPath: input.babyPrdRepoRelPath,
+      contextRepoRelPath: input.contextRepoRelPath,
       priorRecord: input.prevRecord,
       retryNote: input.retryNote,
     });
@@ -118,8 +132,12 @@ function buildPromptForSlot(input: BuildPromptInput): string {
   return buildReviewerPrompt({
     specRepoRelPath: input.specRepoRelPath,
     handoffAbsPath: input.handoffAbsPath,
+    babyPrdRepoRelPath: input.babyPrdRepoRelPath,
+    contextRepoRelPath: input.contextRepoRelPath,
     priorRecord: input.prevRecord as HandoffRecord,
     diff: input.diff ?? "",
+    expectedArtifactPath: input.nextArtifactPath,
+    isFinalPhase: input.isFinalPhase,
     retryNote: input.retryNote,
   });
 }
@@ -132,6 +150,8 @@ interface DispatchOneAttemptInput {
   readonly specRef: FileRef;
   readonly prevRecord: HandoffRecord | null;
   readonly diff: string | null;
+  /** The reviewer's expected next-artifact path, computed once per run (PHASE_4_SPEC.md §6.4, new). */
+  readonly nextArtifactPath: string;
   readonly retryNote: string | null;
 }
 
@@ -144,8 +164,12 @@ async function dispatchOneAttempt(input: DispatchOneAttemptInput) {
     slot,
     specRepoRelPath: config.spec_path,
     handoffAbsPath,
+    babyPrdRepoRelPath: config.baby_prd_path,
+    contextRepoRelPath: config.context_path,
     prevRecord: input.prevRecord,
     diff: input.diff,
+    nextArtifactPath: input.nextArtifactPath,
+    isFinalPhase: config.is_final_phase,
     retryNote: input.retryNote,
   });
   const req: TurnRequest = {
@@ -161,6 +185,9 @@ async function dispatchOneAttempt(input: DispatchOneAttemptInput) {
     priorRecord: input.prevRecord,
     prompt,
     timeoutMs: config.turn_timeout_ms,
+    babyPrdPath: config.baby_prd_path,
+    contextPath: config.context_path,
+    expectedArtifactPath: slot.archetype === "reviewer" ? input.nextArtifactPath : null,
   };
   const result = await runTurn(req, input.deps);
   return { req, result };
@@ -176,9 +203,11 @@ function nonCompleteSummary(
 }
 
 /**
- * [DET] The extended preflight check (§6.5 step 1): the ordinary `runPreflight()` (Phase 1,
- * unchanged) plus a readability check on `config.spec_path`, folded into the same "is everything
- * this run needs actually present and healthy" concept rather than a new exit code.
+ * [DET] The extended preflight check (§6.5 step 1; PHASE_4_SPEC.md §6.4 extends it with two more
+ * checks of the identical shape): the ordinary `runPreflight()` (Phase 1, unchanged) plus
+ * readability checks on `config.spec_path`, `config.baby_prd_path`, and `config.context_path`, all
+ * folded into the same "is everything this run needs actually present and healthy" concept rather
+ * than a new exit code.
  */
 async function runExtendedPreflight(
   config: RunConfig,
@@ -186,16 +215,23 @@ async function runExtendedPreflight(
 ): Promise<{ ok: boolean; problems: readonly string[] }> {
   const summary = await preflightFn(config.repo_dir);
   const problems: string[] = [...summary.problems];
-  let specOk = true;
-  try {
-    await sha256File(repoRelToAbs(config.repo_dir, config.spec_path));
-  } catch {
-    specOk = false;
-    problems.push(
-      `spec_path "${config.spec_path}" does not resolve to a readable file in "${config.repo_dir}".`,
-    );
+  let ok = summary.ok;
+
+  const readabilityChecks: readonly [string, string][] = [
+    ["spec_path", config.spec_path],
+    ["baby_prd_path", config.baby_prd_path],
+    ["context_path", config.context_path],
+  ];
+  for (const [label, path] of readabilityChecks) {
+    try {
+      await sha256File(repoRelToAbs(config.repo_dir, path));
+    } catch {
+      ok = false;
+      problems.push(`${label} "${path}" does not resolve to a readable file in "${config.repo_dir}".`);
+    }
   }
-  return { ok: summary.ok && specOk, problems };
+
+  return { ok, problems };
 }
 
 /**
@@ -232,6 +268,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
 
   const specSha256 = await sha256File(repoRelToAbs(config.repo_dir, config.spec_path));
   const specRef: FileRef = { path: config.spec_path, sha256: specSha256 };
+  const nextArtifactPath = nextPhaseSpecPath(config.spec_path, config.phase, config.is_final_phase);
 
   const plan = planTurnSequence(config);
   const turns: TurnAttemptSummary[] = [];
@@ -257,6 +294,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
       specRef,
       prevRecord,
       diff,
+      nextArtifactPath,
       retryNote: null,
     });
 
@@ -334,6 +372,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
       specRef,
       prevRecord,
       diff,
+      nextArtifactPath,
       retryNote: buildRetryNote(verdict),
     });
 

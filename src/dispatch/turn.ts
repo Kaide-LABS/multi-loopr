@@ -11,6 +11,7 @@ import type { ProviderAdapter } from "../ports/provider-adapter.ts";
 import { runProcess } from "../util/exec.ts";
 import { handoffPath } from "../util/paths.ts";
 import { assertNeutralCommits } from "../verify/commits.ts";
+import { assertLooprArtifactsReferenced, assertNextPhaseSpecProduced } from "./artifacts.ts";
 import { captureGroundTruthBefore, reconcileHandoffRecord } from "./record.ts";
 
 /** Dependencies {@link runTurn} needs beyond the pure `TurnRequest`. */
@@ -57,10 +58,20 @@ function filteredProcessEnv(): Record<string, string> {
  *    genuinely missing) propagates unmodified, an unexpected condition outside this step's
  *    modelled failure set.
  * 7. Reconcile against ground truth (may itself throw `RelaySchemaError`, handled identically).
+ * 7.5. [DECISION Phase 4] `assertLooprArtifactsReferenced()` against the reconciled record, for
+ *    **every** turn (executor and reviewer alike) -- a thrown `LooprArtifactBypassError` is not
+ *    caught here; it propagates unmodified, matching step 8's own uncaught-throw contract.
+ * 7.6. [DECISION Phase 4] `assertNextPhaseSpecProduced()`, only when `req.expectedArtifactPath !==
+ *    null` (a no-op for every executor turn; runs only for the reviewer turn). Same uncaught-throw
+ *    contract.
  * 8. If any real commits were recorded, assert commit neutrality -- a thrown
- *    `BoundaryViolationError` propagates unmodified; I4 is a hard invariant, never retried.
- * 9. Persist the reconciled record at the same path, overwriting the agent's own draft.
- * Implements PHASE_3_SPEC.md §6.4.
+ *    `BoundaryViolationError` propagates unmodified; I4 is a hard invariant, never retried. Runs
+ *    only once both new Phase 4 guards have already passed.
+ * 9. Persist the reconciled record at the same path, overwriting the agent's own draft. Both new
+ *    guards run before this step, so a bypassed or non-produced-artifact turn's record is never
+ *    persisted to `.multi-loopr/runs/**` -- only a turn that cleared every hard invariant ever
+ *    reaches disk.
+ * Implements PHASE_3_SPEC.md §6.4, PHASE_4_SPEC.md §6.3.
  */
 export async function runTurn(req: TurnRequest, deps: RunTurnDeps): Promise<RunTurnResult> {
   const ground = await captureGroundTruthBefore(req.repoDir);
@@ -106,6 +117,16 @@ export async function runTurn(req: TurnRequest, deps: RunTurnDeps): Promise<RunT
       return { outcome: { ok: false, record: null, failure: err }, record: null };
     }
     throw err;
+  }
+
+  assertLooprArtifactsReferenced(reconciled, {
+    babyPrdPath: req.babyPrdPath,
+    contextPath: req.contextPath,
+    specPath: req.specRef.path,
+  });
+
+  if (req.expectedArtifactPath !== null) {
+    await assertNextPhaseSpecProduced(req.repoDir, reconciled, req.expectedArtifactPath);
   }
 
   if (reconciled.repo.commits.length > 0) {

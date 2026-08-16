@@ -30,6 +30,9 @@ function makeTurnRequest(overrides: Partial<TurnRequest> = {}): TurnRequest {
     priorRecord: null,
     prompt: "Implement PHASE_2_SPEC.md.",
     timeoutMs: 1_800_000,
+    babyPrdPath: ".claude/loopr/baby_prd.md",
+    contextPath: ".claude/loopr/context.md",
+    expectedArtifactPath: null,
     ...overrides,
   };
 }

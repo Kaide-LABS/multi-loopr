@@ -16,6 +16,9 @@ function baseConfig(overrides: Partial<RunConfig> = {}): RunConfig {
     turn_timeout_ms: 1_800_000,
     phase: 1,
     spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: ".claude/loopr/baby_prd.md",
+    context_path: ".claude/loopr/context.md",
+    is_final_phase: false,
     ...overrides,
   };
 }

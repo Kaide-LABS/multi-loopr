@@ -59,6 +59,24 @@ export const RunConfig = z.strictObject({
   phase: z.number().int().min(1),
   /** Repo-relative path to the `PHASE_N_SPEC.md` this run's turns work from (PHASE_3_SPEC.md §1.3). */
   spec_path: RepoRelPathLike,
+  /**
+   * Repo-relative path to loopr's own `baby_prd.md` for this build -- required (never nullable):
+   * by the time any `multi-loopr run` dispatch happens, loopr's interrogation stage has necessarily
+   * already produced it. Genuinely read (never generated) by every dispatched turn
+   * (`assertLooprArtifactsReferenced()`, PHASE_4_SPEC.md §6.1).
+   */
+  baby_prd_path: RepoRelPathLike,
+  /** Repo-relative path to loopr's own `context.md` for this build. Same treatment as `baby_prd_path`. */
+  context_path: RepoRelPathLike,
+  /**
+   * Whether this run dispatches the target build's own final phase. Operator-supplied per run --
+   * multi-loopr never infers it. Determines what the reviewer turn is instructed, and mechanically
+   * held, to produce next: `PHASE_(N+1)_SPEC.md` when `false`, a `BUILD_COMPLETE.md` completion
+   * artifact when `true` (`nextPhaseSpecPath()`, PHASE_4_SPEC.md §6.1). Defaults `false` so every
+   * pre-Phase-4 `RunConfig` fixture that omits it keeps parsing, the same reasoning
+   * `turn_timeout_ms`'s own default already established.
+   */
+  is_final_phase: z.boolean().default(false),
 });
 
 /** The inferred type of {@link RunConfig}. */
@@ -87,6 +105,21 @@ export interface TurnRequest {
   readonly priorRecord: HandoffRecord | null;
   readonly prompt: string;
   readonly timeoutMs: number;
+  /**
+   * Repo-relative path to loopr's `baby_prd.md` for this build, threaded from
+   * `RunConfig.baby_prd_path` -- a plain path string, not a `FileRef`: unlike `specRef` it never
+   * participates in a cross-turn consistency check (there is no `C_BABY_PRD_CONTINUITY`), so no
+   * ground-truth hash needs to be precomputed for it. Implements PHASE_4_SPEC.md §1.2.
+   */
+  readonly babyPrdPath: string;
+  /** Repo-relative path to loopr's `context.md` for this build, threaded from `RunConfig.context_path`. */
+  readonly contextPath: string;
+  /**
+   * The repo-relative path the reviewer turn must genuinely produce next (`nextPhaseSpecPath()`),
+   * or `null` for every executor turn -- the same "null unless this specific slot needs it" shape
+   * `diff` already uses in `run-loop.ts`'s `BuildPromptInput`. Implements PHASE_4_SPEC.md §1.2.
+   */
+  readonly expectedArtifactPath: string | null;
 }
 
 /** The raw result of spawning a child process, before any provider-specific interpretation. */

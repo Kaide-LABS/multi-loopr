@@ -4,14 +4,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { BoundaryViolationError, InternalError, IsolationLeakError, RelaySchemaError } from "../domain/errors.ts";
-import type { HandoffRecord } from "../domain/relay.ts";
+import { BoundaryViolationError, InternalError, IsolationLeakError, LooprArtifactBypassError, RelaySchemaError } from "../domain/errors.ts";
+import type { FileRef, HandoffRecord } from "../domain/relay.ts";
 import { writeHandoffRecord } from "../domain/relay.ts";
 import type { RawInvocationResult, TurnOutcome, TurnRequest } from "../domain/run.ts";
 import type { Invocation, PreflightReport, ProviderAdapter } from "../ports/provider-adapter.ts";
 import { runProcess } from "../util/exec.ts";
+import { sha256File } from "../util/hash.ts";
 import { handoffPath } from "../util/paths.ts";
 import { runTurn } from "./turn.ts";
 
@@ -42,6 +43,26 @@ async function freshRepo(): Promise<string> {
   const dir = await mkdtemp(`${tmpdir()}/multi-loopr-turn-test-`);
   await initRepo(dir);
   return dir;
+}
+
+/**
+ * Writes multi-loopr's three canonical loopr artifacts (`baby_prd.md`, `context.md`, and a spec
+ * file matching `baseReq()`'s own `specRef.path`/`babyPrdPath`/`contextPath` defaults) as real files
+ * on disk (not necessarily committed -- `reconcileFileRefs`, Phase 3, unmodified, hashes from disk
+ * regardless of git state) and returns their `FileRef`s so a test can populate a draft's
+ * `artifacts_read` with entries that survive ground-truth reconciliation (PHASE_4_SPEC.md §6.1:
+ * `assertLooprArtifactsReferenced()` only accepts a *reconciled* record's `artifacts_read`, and a
+ * reconciled entry only survives if its path resolves to a real file).
+ */
+async function writeLooprArtifacts(dir: string): Promise<{ babyPrd: FileRef; context: FileRef; spec: FileRef }> {
+  await writeFile(`${dir}/baby_prd.md`, "baby prd content\n", "utf8");
+  await writeFile(`${dir}/context.md`, "context content\n", "utf8");
+  await writeFile(`${dir}/PHASE_1_SPEC.md`, "spec content\n", "utf8");
+  return {
+    babyPrd: { path: "baby_prd.md", sha256: await sha256File(`${dir}/baby_prd.md`) },
+    context: { path: "context.md", sha256: await sha256File(`${dir}/context.md`) },
+    spec: { path: "PHASE_1_SPEC.md", sha256: await sha256File(`${dir}/PHASE_1_SPEC.md`) },
+  };
 }
 
 class FakeAdapter implements ProviderAdapter {
@@ -77,11 +98,18 @@ function baseReq(overrides: Partial<TurnRequest> = {}): TurnRequest {
     priorRecord: null,
     prompt: "do the work",
     timeoutMs: 30_000,
+    babyPrdPath: "baby_prd.md",
+    contextPath: "context.md",
+    expectedArtifactPath: null,
     ...overrides,
   };
 }
 
-function draftFor(req: TurnRequest, repo: HandoffRecord["repo"]): HandoffRecord {
+function draftFor(
+  req: TurnRequest,
+  repo: HandoffRecord["repo"],
+  overrides: { readonly artifactsRead?: readonly FileRef[]; readonly artifactsWritten?: readonly FileRef[] } = {},
+): HandoffRecord {
   return {
     schema_version: 1,
     run_id: req.runId,
@@ -94,8 +122,8 @@ function draftFor(req: TurnRequest, repo: HandoffRecord["repo"]): HandoffRecord 
     completed_at: "2026-08-16T10:05:00Z",
     repo,
     spec_ref: { path: "WRONG.md", sha256: "0".repeat(64) },
-    artifacts_read: [],
-    artifacts_written: [],
+    artifacts_read: overrides.artifactsRead ? [...overrides.artifactsRead] : [],
+    artifacts_written: overrides.artifactsWritten ? [...overrides.artifactsWritten] : [],
     status: "completed",
     work_done: "did work",
     next_steps: [],
@@ -108,6 +136,7 @@ test("runTurn: happy path reconciles and persists the record, overwriting the ag
   const dir = await freshRepo();
   try {
     const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
     const req = baseReq({ repoDir: dir });
     const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
 
@@ -116,7 +145,11 @@ test("runTurn: happy path reconciles and persists the record, overwriting the ag
       await commitFile(dir, "foo.txt", "v1\n", "agent's turn");
       await writeHandoffRecord(
         path,
-        draftFor(req, { branch: "wrong-branch", head_before: "1".repeat(40), head_after: "2".repeat(40), commits: ["2".repeat(40)] }),
+        draftFor(
+          req,
+          { branch: "wrong-branch", head_before: "1".repeat(40), head_after: "2".repeat(40), commits: ["2".repeat(40)] },
+          { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+        ),
       );
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
     };
@@ -244,6 +277,7 @@ test("runTurn: a commit carrying an AI-attribution trailer propagates BoundaryVi
   const dir = await freshRepo();
   try {
     const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
     const req = baseReq({ repoDir: dir });
     const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
 
@@ -252,7 +286,14 @@ test("runTurn: a commit carrying an AI-attribution trailer propagates BoundaryVi
       await git(dir, ["add", "bar.txt"]);
       await git(dir, ["commit", "--quiet", "-m", "dirty commit\n\nCo-Authored-By: Claude <noreply@anthropic.com>"]);
       const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
-      await writeHandoffRecord(path, draftFor(req, { branch: "main", head_before: commit0, head_after: head, commits: [head] }));
+      await writeHandoffRecord(
+        path,
+        draftFor(
+          req,
+          { branch: "main", head_before: commit0, head_after: head, commits: [head] },
+          { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+        ),
+      );
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
     };
 
@@ -303,6 +344,131 @@ test("runTurn: timeoutMs passes straight through to runProcessFn, unmodified", a
     await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
 
     assert.equal(capturedTimeout, 123456);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// PHASE_4_SPEC.md §6.3 -- the two new artifact guards (§8 acceptance criteria #13-15, #19, #21, #22)
+// -------------------------------------------------------------------------------------------
+
+test("runTurn: an executor turn whose reconciled artifacts_read never references baby_prd_path/context_path/spec_path propagates LooprArtifactBypassError unmodified, uncaught -- the guard is not skipped for an executor slot", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    // Deliberately do NOT call writeLooprArtifacts/populate artifacts_read -- the agent worked the
+    // repo but never genuinely referenced loopr's own canonical artifacts.
+    const req = baseReq({ repoDir: dir, archetype: "executor" });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await commitFile(dir, "foo.txt", "v1\n", "agent's turn");
+      const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
+      await writeHandoffRecord(path, draftFor(req, { branch: "main", head_before: commit0, head_after: head, commits: [head] }));
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    await assert.rejects(
+      () => runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess }),
+      (err: unknown) => {
+        assert.ok(err instanceof LooprArtifactBypassError);
+        assert.equal(err.exitCode, 12);
+        assert.ok(err.message.includes("baby_prd_path"));
+        assert.ok(err.message.includes("context_path"));
+        assert.ok(err.message.includes("spec_path"));
+        return true;
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: the same bypass on a reviewer turn also propagates LooprArtifactBypassError -- the guard is archetype-agnostic, not skipped for the reviewer slot either", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const req = baseReq({ repoDir: dir, archetype: "reviewer", expectedArtifactPath: null });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await commitFile(dir, "foo.txt", "v1\n", "reviewer's turn");
+      const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
+      await writeHandoffRecord(path, draftFor(req, { branch: "main", head_before: commit0, head_after: head, commits: [head] }));
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    await assert.rejects(
+      () => runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess }),
+      (err: unknown) => {
+        assert.ok(err instanceof LooprArtifactBypassError);
+        return true;
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: assertNextPhaseSpecProduced is never invoked for an executor request (expectedArtifactPath === null) -- a reviewer-only next-artifact path is never even checked to exist", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
+    // expectedArtifactPath stays null (baseReq's default) -- an executor slot never has one.
+    const req = baseReq({ repoDir: dir, archetype: "executor" });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      // This turn's commits never touch "PHASE_2_SPEC.md" -- if assertNextPhaseSpecProduced were
+      // (incorrectly) invoked for this executor request, it would throw. It must not be.
+      await commitFile(dir, "foo.txt", "v1\n", "executor's turn");
+      const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
+      await writeHandoffRecord(
+        path,
+        draftFor(
+          req,
+          { branch: "main", head_before: commit0, head_after: head, commits: [head] },
+          { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+        ),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+
+    assert.equal(result.outcome.ok, true);
+    assert.ok(result.record !== null);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: when either new guard throws, writeHandoffRecord is never called for that turn -- the would-be-bypassed record is not persisted at handoffPath()", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await commitFile(dir, "foo.txt", "v1\n", "agent's turn");
+      const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
+      // Deliberately omits artifacts_read entirely -- assertLooprArtifactsReferenced must throw
+      // before the reconciled record (which the agent's own draft here is a stand-in for, since
+      // reconciliation only replaces repo/spec_ref/artifact hashes) is ever persisted again.
+      await writeHandoffRecord(path, draftFor(req, { branch: "main", head_before: commit0, head_after: head, commits: [head] }));
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    await assert.rejects(() => runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess }));
+
+    // The on-disk record still holds the agent's own pre-reconciliation draft (never overwritten),
+    // proving writeHandoffRecord (step 9) never re-ran after the guard's throw at step 7.5.
+    const onDisk = await readFile(path, "utf8");
+    const parsed = JSON.parse(onDisk) as { readonly spec_ref: { readonly path: string } };
+    assert.equal(parsed.spec_ref.path, "WRONG.md");
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

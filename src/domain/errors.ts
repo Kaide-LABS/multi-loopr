@@ -22,6 +22,7 @@ export const ExitCode = {
   TIER_WELDING: 9,
   TURN_TIMEOUT: 10,
   RUN_HALTED: 11,
+  LOOPR_ARTIFACT_BYPASSED: 12,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */
@@ -118,6 +119,22 @@ export class TurnTimeoutError extends MultiLooprError {
 export class RunHaltedError extends MultiLooprError {
   readonly exitCode = ExitCode.RUN_HALTED;
   readonly code = "RUN_HALTED";
+}
+
+/**
+ * A turn's reconciled `HandoffRecord` failed one of Phase 4's two new loopr-artifact guards: either
+ * `artifacts_read` never referenced one of `baby_prd_path`/`context_path`/`spec_path`
+ * (`assertLooprArtifactsReferenced()`), or the reviewer turn's `artifacts_written` did not name a
+ * genuinely turn-produced next-phase artifact (`assertNextPhaseSpecProduced()`). One error class
+ * covers both checks -- they are the same *kind* of failure under PRD AC3 ("the agent did not
+ * genuinely engage with loopr's own artifacts"), the same reasoning already applied to
+ * {@link BoundaryViolationError} covering six distinct boundary-rule violations under one exit
+ * code. The distinguishing detail lives in the thrown error's own `message`/`details`. Implements
+ * PHASE_4_SPEC.md §1.3/§3.3.
+ */
+export class LooprArtifactBypassError extends MultiLooprError {
+  readonly exitCode = ExitCode.LOOPR_ARTIFACT_BYPASSED;
+  readonly code = "LOOPR_ARTIFACT_BYPASSED";
 }
 
 /**

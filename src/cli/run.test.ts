@@ -31,6 +31,7 @@ import { writeHandoffRecord } from "../domain/relay.ts";
 import type { AdapterRegistry, Invocation, PreflightReport, ProviderAdapter } from "../ports/provider-adapter.ts";
 import type { PreflightSummary } from "../verify/preflight.ts";
 import { handoffPath } from "../util/paths.ts";
+import { sha256File } from "../util/hash.ts";
 import { runProcess } from "../util/exec.ts";
 import type { ProviderId, TurnOutcome, TurnRequest } from "../domain/run.ts";
 import { RunConfig } from "../domain/run.ts";
@@ -64,7 +65,9 @@ async function freshRepoWithSpec(): Promise<string> {
   await git(dir, ["config", "user.email", "test@example.com"]);
   await git(dir, ["config", "user.name", "Test"]);
   await writeFile(`${dir}/PHASE_1_SPEC.md`, "spec content\n", "utf8");
-  await git(dir, ["add", "PHASE_1_SPEC.md"]);
+  await writeFile(`${dir}/baby_prd.md`, "baby prd content\n", "utf8");
+  await writeFile(`${dir}/context.md`, "context content\n", "utf8");
+  await git(dir, ["add", "PHASE_1_SPEC.md", "baby_prd.md", "context.md"]);
   await git(dir, ["commit", "--quiet", "-m", "add spec"]);
   return dir;
 }
@@ -78,6 +81,9 @@ function validConfigJson(dir: string): string {
     turn_timeout_ms: 1_800_000,
     phase: 1,
     spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+    is_final_phase: false,
   };
   return JSON.stringify(config);
 }
@@ -88,7 +94,8 @@ function validConfigJson(dir: string): string {
  * checks `spec_path` readability unconditionally and ANDs it into overall preflight `ok` regardless
  * of `runPreflight()`'s own toolchain/provider-auth result -- so a dispatch against this config
  * deterministically fails preflight (`exitCode` `PREFLIGHT_FAILED`) and never reaches the run lock or
- * turn loop, on any machine, in any provider-auth state.
+ * turn loop, on any machine, in any provider-auth state. `baby_prd_path`/`context_path` are still
+ * given real, readable values so the resulting `problems` list is unambiguously about `spec_path`.
  */
 function configJsonWithUnreadableSpecPath(dir: string): string {
   const config: RunConfig = {
@@ -99,12 +106,28 @@ function configJsonWithUnreadableSpecPath(dir: string): string {
     turn_timeout_ms: 1_800_000,
     phase: 1,
     spec_path: "MISSING_SPEC_DOES_NOT_EXIST.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+    is_final_phase: false,
   };
   return JSON.stringify(config);
 }
 
 async function cleanup(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
+/**
+ * `FileRef`s for `freshRepoWithSpec()`'s own `baby_prd.md`/`context.md`/`PHASE_1_SPEC.md`, computed
+ * from the real files on disk -- required in every turn's `artifacts_read` since Phase 4's
+ * `assertLooprArtifactsReferenced()` now runs unconditionally (PHASE_4_SPEC.md §6.3).
+ */
+async function looprArtifactRefs(dir: string): Promise<{ babyPrd: FileRef; context: FileRef; spec: FileRef }> {
+  return {
+    babyPrd: { path: "baby_prd.md", sha256: await sha256File(`${dir}/baby_prd.md`) },
+    context: { path: "context.md", sha256: await sha256File(`${dir}/context.md`) },
+    spec: { path: "PHASE_1_SPEC.md", sha256: await sha256File(`${dir}/PHASE_1_SPEC.md`) },
+  };
 }
 
 async function commitFile(dir: string, relPath: string, content: string, message: string): Promise<void> {
@@ -233,6 +256,8 @@ test("RunConfig rejects phase: 0 and phase: -1", () => {
     repo_dir: "/tmp/repo",
     executor_providers: ["claude-code", "codex-cli"],
     spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
   };
   assert.equal(RunConfig.safeParse({ ...base, phase: 0 }).success, false);
   assert.equal(RunConfig.safeParse({ ...base, phase: -1 }).success, false);
@@ -245,11 +270,62 @@ test("RunConfig rejects an absolute spec_path and a spec_path containing a .. se
     repo_dir: "/tmp/repo",
     executor_providers: ["claude-code", "codex-cli"],
     phase: 1,
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
   };
   assert.equal(RunConfig.safeParse({ ...base, spec_path: "/etc/passwd" }).success, false);
   assert.equal(RunConfig.safeParse({ ...base, spec_path: "C:/etc/passwd" }).success, false);
   assert.equal(RunConfig.safeParse({ ...base, spec_path: "../outside.md" }).success, false);
   assert.equal(RunConfig.safeParse({ ...base, spec_path: "PHASE_1_SPEC.md" }).success, true);
+});
+
+test("RunConfig rejects an absolute baby_prd_path and a baby_prd_path containing a .. segment", () => {
+  const base = {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    context_path: "context.md",
+  };
+  assert.equal(RunConfig.safeParse({ ...base, baby_prd_path: "/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, baby_prd_path: "C:/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, baby_prd_path: "../outside.md" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, baby_prd_path: "baby_prd.md" }).success, true);
+});
+
+test("RunConfig rejects an absolute context_path and a context_path containing a .. segment", () => {
+  const base = {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+  };
+  assert.equal(RunConfig.safeParse({ ...base, context_path: "/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, context_path: "C:/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, context_path: "../outside.md" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, context_path: "context.md" }).success, true);
+});
+
+test("RunConfig.is_final_phase defaults to false when omitted, and accepts an explicit true", () => {
+  const base = {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+  };
+  const omitted = RunConfig.safeParse(base);
+  assert.equal(omitted.success, true);
+  assert.equal(omitted.success ? omitted.data.is_final_phase : undefined, false);
+
+  const explicitTrue = RunConfig.safeParse({ ...base, is_final_phase: true });
+  assert.equal(explicitTrue.success, true);
+  assert.equal(explicitTrue.success ? explicitTrue.data.is_final_phase : undefined, true);
 });
 
 test("runRunCommand dispatches a valid config and returns a RunReport whose exit_code passes through runDispatch's own result", async () => {
@@ -267,6 +343,7 @@ test("runRunCommand dispatches a valid config and returns a RunReport whose exit
     const claude = new RecordingFakeAdapter("claude-code");
     const codex = new RecordingFakeAdapter("codex-cli");
     const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
 
     let call = 0;
     const runProcessFn: typeof runProcess = async () => {
@@ -276,22 +353,34 @@ test("runRunCommand dispatches a valid config and returns a RunReport whose exit
         await commitFile(dir, "foo.txt", "v1\n", "turn0");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
-          draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
         );
       } else if (step === 1) {
         await commitFile(dir, "bar.txt", "v1\n", "turn1");
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
           draft({
-            artifactsRead: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
             artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
           }),
         );
       } else {
-        await commitFile(dir, "reviewed.txt", "v1\n", "turn2");
+        // The reviewer turn's own Phase 4 responsibility: genuinely produce the next loopr
+        // artifact (PHASE_2_SPEC.md, since phase: 1 and is_final_phase: false) for real, as part
+        // of this turn's own commit -- assertNextPhaseSpecProduced() requires both a declared
+        // artifacts_written entry AND a commit that actually touches the path.
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, 2, "reviewer", "claude-code"),
-          draft({ role: "reviewer", artifactsRead: [{ path: "bar.txt", sha256: "a".repeat(64) }] }),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
         );
       }
       return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };

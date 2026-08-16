@@ -38,19 +38,31 @@ export interface ProtocolInstructionParams {
   readonly handoffAbsPath: string;
   readonly role: "executor" | "reviewer";
   readonly specRepoRelPath: string;
+  /** Repo-relative path to loopr's `baby_prd.md` for this build (PHASE_4_SPEC.md §6.2, new). */
+  readonly babyPrdRepoRelPath: string;
+  /** Repo-relative path to loopr's `context.md` for this build (PHASE_4_SPEC.md §6.2, new). */
+  readonly contextRepoRelPath: string;
 }
 
 /**
  * Renders the protocol instructions every dispatched turn receives: the exact `HandoffRecord`
  * shape to produce, where to write it, the isolation rule, the advisory-only nature of
- * agent-authored `repo`/`spec_ref`, and the honest-halt requirement. Prose is not fixed verbatim
- * by the spec -- what is load-bearing is that each of the six mandatory-content items appears as a
- * literal substring (PHASE_3_SPEC.md §6.2, tested individually). Implements PHASE_3_SPEC.md §6.2.
+ * agent-authored `repo`/`spec_ref`, the honest-halt requirement, and (Phase 4, new) the instruction
+ * to genuinely read and record loopr's own `baby_prd.md`/`context.md` for this build. Prose is not
+ * fixed verbatim by the spec -- what is load-bearing is that each of the eight mandatory-content
+ * items appears as a literal substring (PHASE_3_SPEC.md §6.2 items 1-6, PHASE_4_SPEC.md §6.2 items
+ * 7-8, all tested individually). Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
  */
 export function buildProtocolInstructions(p: ProtocolInstructionParams): string {
   return [
     `You are participating in a multi-loopr dispatched ${p.role} turn.`,
     `Read the phase spec at repo-relative path "${p.specRepoRelPath}" and do the work it describes.`,
+    "",
+    `Read loopr's foundational problem-statement artifact for this build at repo-relative path ` +
+      `"${p.babyPrdRepoRelPath}" and record it in artifacts_read.`,
+    "",
+    `Read loopr's foundational context artifact for this build at repo-relative path ` +
+      `"${p.contextRepoRelPath}" and record it in artifacts_read.`,
     "",
     `When your turn ends (whether complete or not), write a single JSON HandoffRecord document to ` +
       `the exact path "${p.handoffAbsPath}". The record must be a JSON object with exactly these ` +
@@ -114,14 +126,21 @@ export interface BuildExecutorPromptParams {
   readonly role: "executor";
   readonly specRepoRelPath: string;
   readonly handoffAbsPath: string;
+  /** Repo-relative path to loopr's `baby_prd.md` for this build (PHASE_4_SPEC.md §1.4, new). */
+  readonly babyPrdRepoRelPath: string;
+  /** Repo-relative path to loopr's `context.md` for this build (PHASE_4_SPEC.md §1.4, new). */
+  readonly contextRepoRelPath: string;
   readonly priorRecord: HandoffRecord | null;
   readonly retryNote: string | null;
 }
 
 /**
- * Concatenates: `getRole("executor").profileSummary` + {@link buildProtocolInstructions} +
+ * Concatenates: `getRole("executor").profileSummary` + {@link buildProtocolInstructions} (now
+ * including the baby_prd/context mandatory-content items) +
  * (`priorRecord === null` ? nothing : {@link buildHandoffContext}, for the second executor turn) +
- * (`retryNote` when non-null). Implements PHASE_3_SPEC.md §6.2.
+ * (`retryNote` when non-null). No production-instruction block is ever added for an executor turn
+ * -- {@link buildArtifactProductionInstructions} is reviewer-only. Implements PHASE_3_SPEC.md §6.2,
+ * PHASE_4_SPEC.md §6.2.
  */
 export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
   const parts: string[] = [
@@ -130,6 +149,8 @@ export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
       handoffAbsPath: params.handoffAbsPath,
       role: "executor",
       specRepoRelPath: params.specRepoRelPath,
+      babyPrdRepoRelPath: params.babyPrdRepoRelPath,
+      contextRepoRelPath: params.contextRepoRelPath,
     }),
   ];
   if (params.priorRecord !== null) {
@@ -141,21 +162,60 @@ export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
   return parts.join("\n\n");
 }
 
+/**
+ * [DECISION Phase 4] Reviewer-only addendum instructing the reviewer to genuinely write loopr's
+ * next phase artifact as part of this turn, never merely reference it -- the mechanical
+ * counterpart to `assertNextPhaseSpecProduced()` (`src/dispatch/artifacts.ts`). Prose is not fixed
+ * verbatim, but two items are load-bearing and tested by substring: (1) the literal
+ * `expectedArtifactPath`, as the exact repo-relative path the reviewer must write real content to;
+ * (2) an explicit statement, branching on `isFinalPhase`, of what that content must be -- the real
+ * next phase's technical blueprint on a non-final phase, this build's completion record on the
+ * final phase -- and that the path must be recorded, with its real hash, in `artifacts_written`, or
+ * multi-loopr will treat the phase as bypassed, not completed. Never called from
+ * {@link buildExecutorPrompt}. Implements PHASE_4_SPEC.md §6.2.
+ */
+export function buildArtifactProductionInstructions(expectedArtifactPath: string, isFinalPhase: boolean): string {
+  const contentDescription = isFinalPhase
+    ? "this build's completion record"
+    : `the real next phase's technical blueprint (following this project's own established spec ` +
+      `structure), at "${expectedArtifactPath}"`;
+  return [
+    "You must genuinely produce loopr's next phase artifact for real, as part of this turn -- " +
+      "not merely reference or restate an existing one.",
+    `Write substantive, real content to the exact repo-relative path "${expectedArtifactPath}". ` +
+      `That content must be ${contentDescription}.`,
+    `You must also record "${expectedArtifactPath}" with its real SHA-256 hash in ` +
+      "artifacts_written -- otherwise multi-loopr will treat this phase as bypassed, not completed.",
+  ].join("\n");
+}
+
 /** Parameters for {@link buildReviewerPrompt}. */
 export interface BuildReviewerPromptParams {
   readonly specRepoRelPath: string;
   readonly handoffAbsPath: string;
+  /** Repo-relative path to loopr's `baby_prd.md` for this build (PHASE_4_SPEC.md §1.4, new). */
+  readonly babyPrdRepoRelPath: string;
+  /** Repo-relative path to loopr's `context.md` for this build (PHASE_4_SPEC.md §1.4, new). */
+  readonly contextRepoRelPath: string;
   readonly priorRecord: HandoffRecord;
   readonly diff: string;
+  /** The repo-relative path this reviewer turn must genuinely produce (PHASE_4_SPEC.md §1.4, new). */
+  readonly expectedArtifactPath: string;
+  /** Whether this run's reviewer turn is the target build's own final phase (PHASE_4_SPEC.md §1.4, new). */
+  readonly isFinalPhase: boolean;
   readonly retryNote: string | null;
 }
 
 /**
- * Concatenates: `getRole("reviewer").profileSummary` + {@link buildProtocolInstructions} +
- * {@link buildHandoffContext} + a capped rendering of `params.diff` + (`retryNote` when non-null).
- * The literal, mechanical form of PRD §9 FM2: "the reviewer's turn payload is assembled only from
- * `spec_ref` + git diff + the previous `HandoffRecord`'s allow-listed fields -- never from
- * provider log files". Implements PHASE_3_SPEC.md §6.2.
+ * Concatenates: `getRole("reviewer").profileSummary` + {@link buildProtocolInstructions} (now
+ * including the baby_prd/context mandatory-content items) +
+ * {@link buildArtifactProductionInstructions} (Phase 4, new -- placed immediately after the
+ * protocol instructions and before the handoff/diff context, matching the existing convention that
+ * instructions-about-the-task precede context-about-prior-work) + {@link buildHandoffContext} + a
+ * capped rendering of `params.diff` + (`retryNote` when non-null). The literal, mechanical form of
+ * PRD §9 FM2: "the reviewer's turn payload is assembled only from `spec_ref` + git diff + the
+ * previous `HandoffRecord`'s allow-listed fields -- never from provider log files". Implements
+ * PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
  */
 export function buildReviewerPrompt(params: BuildReviewerPromptParams): string {
   const parts: string[] = [
@@ -164,7 +224,10 @@ export function buildReviewerPrompt(params: BuildReviewerPromptParams): string {
       handoffAbsPath: params.handoffAbsPath,
       role: "reviewer",
       specRepoRelPath: params.specRepoRelPath,
+      babyPrdRepoRelPath: params.babyPrdRepoRelPath,
+      contextRepoRelPath: params.contextRepoRelPath,
     }),
+    buildArtifactProductionInstructions(params.expectedArtifactPath, params.isFinalPhase),
     buildHandoffContext(params.priorRecord),
     `Diff under review (${params.specRepoRelPath}'s executor turns):\n${truncateDiff(params.diff)}`,
   ];
