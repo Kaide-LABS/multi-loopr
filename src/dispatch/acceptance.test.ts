@@ -1,16 +1,18 @@
 // Implements PHASE_5_SPEC.md §1.1 -- acceptance.test.ts
-// Covers §8 acceptance criteria #10-18. Every test uses a real temporary git repository and real,
-// hand-constructed `HandoffRecord` JSON files written to a real `handoff/` directory
-// (`continuity.test.ts`'s and `artifacts.test.ts`'s own established pattern) -- no test in this file
-// spawns a real `claude` or `codex` process.
+// Covers §8 acceptance criteria #10-18 and #28. Every AC1-3 test uses a real temporary git
+// repository and real, hand-constructed `HandoffRecord` JSON files written to a real `handoff/`
+// directory (`continuity.test.ts`'s and `artifacts.test.ts`'s own established pattern) -- no test in
+// this file spawns a real `claude` or `codex` process.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import type { FileRef, HandoffRecord } from "../domain/relay.ts";
 import { writeHandoffRecord } from "../domain/relay.ts";
 import type { ProviderId } from "../domain/run.ts";
+import { RunConfig } from "../domain/run.ts";
 import { runProcess } from "../util/exec.ts";
 import { handoffPath } from "../util/paths.ts";
 import { sha256File } from "../util/hash.ts";
@@ -674,4 +676,36 @@ test("assessAcceptanceEvidence: finalPhase: false passes production against a ge
   } finally {
     await cleanup(dir);
   }
+});
+
+// -------------------------------------------------------------------------------------------
+// §8 #28 -- examples/toy-build/run-config.template.json parses as JSON and, with its two
+// placeholders replaced by a valid UUID and an absolute path, validates against RunConfig. This is
+// the one item in the "toy build fixture" acceptance-criteria section that can be checked without
+// any live provider CLI -- it tests the template's own shape, not a live dispatch.
+// -------------------------------------------------------------------------------------------
+
+const RUN_CONFIG_TEMPLATE_PATH = fileURLToPath(
+  new URL("../../examples/toy-build/run-config.template.json", import.meta.url),
+);
+
+test("examples/toy-build/run-config.template.json parses as JSON and, with its two placeholders filled in, validates against RunConfig", async () => {
+  const raw = await readFile(RUN_CONFIG_TEMPLATE_PATH, "utf8");
+  const parsed: unknown = JSON.parse(raw);
+  assert.ok(typeof parsed === "object" && parsed !== null);
+
+  const filled = {
+    ...(parsed as Record<string, unknown>),
+    run_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    repo_dir: process.platform === "win32" ? "C:\\tmp\\toy-build-target" : "/tmp/toy-build-target",
+  };
+
+  const config = RunConfig.parse(filled);
+  assert.deepStrictEqual(config.executor_providers, ["claude-code", "codex-cli"]);
+  assert.equal(config.reviewer_provider, null);
+  assert.equal(config.phase, 1);
+  assert.equal(config.spec_path, "loopr/PHASE_1_SPEC.md");
+  assert.equal(config.baby_prd_path, "loopr/baby_prd.md");
+  assert.equal(config.context_path, "loopr/context.md");
+  assert.equal(config.is_final_phase, true);
 });
