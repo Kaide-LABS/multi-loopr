@@ -118,6 +118,25 @@ export async function commitsBetween(repoDir: string, fromOid: string, toOid: st
 }
 
 /**
+ * `git diff <fromOid>..<toOid>` -- the full unified diff body (no `--name-only`), unlike
+ * {@link changedPaths}, which intentionally returns only names. Exit non-zero -> {@link InternalError},
+ * matching this file's existing wrapper convention exactly. Implements PHASE_3_SPEC.md §1.6.
+ */
+export async function diffText(repoDir: string, fromOid: string, toOid: string): Promise<string> {
+  const result = await git(repoDir, ["diff", `${fromOid}..${toOid}`]);
+  if (result.exitCode !== 0) {
+    throw new InternalError(`git diff ${fromOid}..${toOid} failed in ${repoDir}: ${result.stderr.trim()}`, {
+      repoDir,
+      fromOid,
+      toOid,
+      exitCode: result.exitCode,
+      stderr: result.stderr,
+    });
+  }
+  return result.stdout;
+}
+
+/**
  * `git show -s --format=%B <oid>`, called once per OID (never batched with a separator, which
  * could appear inside a message body). Returns each commit's full raw message body, in the same
  * order as `oids`.

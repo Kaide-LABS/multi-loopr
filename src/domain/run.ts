@@ -16,6 +16,22 @@ import type { Archetype } from "./roles.ts";
 import type { ModelTier } from "./tiers.ts";
 import type { FileRef, HandoffRecord } from "./relay.ts";
 import type { MultiLooprError } from "./errors.ts";
+import { isSafeRepoRelPath } from "../util/paths.ts";
+
+/**
+ * A repo-relative POSIX path, declared locally rather than imported from `./relay.ts`'s
+ * `RepoRelPath` -- this file has zero *runtime* dependency on `relay.ts` (see the module
+ * dependency note above) to keep the two files' dependency a one-directional DAG. This is not a
+ * new safety rule: it delegates to the same single-source-of-truth `isSafeRepoRelPath`
+ * (`src/util/paths.ts`) that `RepoRelPath` itself already delegates to (PHASE_1_SPEC.md §6.3: "the
+ * rule lives in one place"), just declared a second time as a schema value in the one file that
+ * cannot safely import the other's schema object without a cycle. Implements PHASE_3_SPEC.md §1.3.
+ */
+const RepoRelPathLike = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(isSafeRepoRelPath, "must be a safe, repo-relative POSIX path (no absolute path, no backslash separators, no upward traversal)");
 
 /** The two provider CLIs multi-loopr V1 drives (PRD §5, fixed pair). */
 export const PROVIDER_IDS = ["claude-code", "codex-cli"] as const;
@@ -39,6 +55,10 @@ export const RunConfig = z.strictObject({
   reviewer_provider: ProviderIdSchema.nullable().default(null),
   turn_timeout_ms: z.number().int().min(1000).max(7_200_000).default(1_800_000),
   model_overrides: z.record(ProviderIdSchema, z.string().min(1)).optional(),
+  /** Which loopr phase this run dispatches (PHASE_3_SPEC.md §1.3). */
+  phase: z.number().int().min(1),
+  /** Repo-relative path to the `PHASE_N_SPEC.md` this run's turns work from (PHASE_3_SPEC.md §1.3). */
+  spec_path: RepoRelPathLike,
 });
 
 /** The inferred type of {@link RunConfig}. */

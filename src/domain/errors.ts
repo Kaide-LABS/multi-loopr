@@ -21,6 +21,7 @@ export const ExitCode = {
   LOCK_HELD: 8,
   TIER_WELDING: 9,
   TURN_TIMEOUT: 10,
+  RUN_HALTED: 11,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */
@@ -106,6 +107,17 @@ export class TierWeldingError extends MultiLooprError {
 export class TurnTimeoutError extends MultiLooprError {
   readonly exitCode = ExitCode.TURN_TIMEOUT;
   readonly code = "TURN_TIMEOUT";
+}
+
+/**
+ * A turn's `HandoffRecord.status` was `"blocked"` or `"halted"` -- the run stopped because the
+ * dispatched agent said it could not, or should not, continue (PRD §9; distinct from every other
+ * error class: not a process failure, not a schema defect, not a continuity failure, not a
+ * timeout). Implements PHASE_3_SPEC.md §1.4.
+ */
+export class RunHaltedError extends MultiLooprError {
+  readonly exitCode = ExitCode.RUN_HALTED;
+  readonly code = "RUN_HALTED";
 }
 
 /**

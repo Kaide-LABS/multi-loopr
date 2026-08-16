@@ -51,6 +51,18 @@ export function runLockPath(repoDir: string): string {
 }
 
 /**
+ * Resolves a repo-relative POSIX path (already known-safe, i.e. it has passed
+ * `isSafeRepoRelPath`/`RepoRelPath`) to an absolute path. Straight concatenation is correct and
+ * sufficient here (not `node:path.join`/`resolve`) precisely because the input is already
+ * constrained: no leading `/`, no drive letter, no `..` segment, POSIX separators only -- the same
+ * safety guarantee every other path-builder in this file already relies on. Implements
+ * PHASE_3_SPEC.md §1.5.
+ */
+export function repoRelToAbs(repoDir: string, repoRelPath: string): string {
+  return `${repoDir}/${repoRelPath}`;
+}
+
+/**
  * The path a given turn's `HandoffRecord` is written to:
  * `<repoDir>/.multi-loopr/runs/<runId>/handoff/<phase>/<turnIndex>-<role>-<provider>.json`, with
  * `turnIndex` zero-padded to 3 digits so lexical order equals numeric order.

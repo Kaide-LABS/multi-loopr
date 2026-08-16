@@ -6,6 +6,8 @@ orchestrator. It uses each provider's own existing (BYOA) credentials, runs enti
 operator's own machine, and hands a loopr-disciplined build phase off from one provider's agent
 to the other so the second genuinely continues the first's work.
 
+A `multi-loopr run --config <path>` command dispatches one loopr phase's sequential turn sequence.
+
 ## Requirements
 
 - Node.js `>=24.0.0`
