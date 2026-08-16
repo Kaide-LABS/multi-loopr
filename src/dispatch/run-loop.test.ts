@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { InternalError, TurnTimeoutError } from "../domain/errors.ts";
+import { BoundaryViolationError, InternalError, TurnTimeoutError } from "../domain/errors.ts";
 import type { FileRef, HaltSignal, HandoffRecord } from "../domain/relay.ts";
 import { writeHandoffRecord } from "../domain/relay.ts";
 import type { ProviderId, RawInvocationResult, RunConfig, TurnOutcome, TurnRequest } from "../domain/run.ts";
@@ -421,6 +421,47 @@ test("runDispatch: an adapter-reported failure (e.g. a timeout) on the first tur
     assert.equal(result.turns.length, 1);
     assert.equal(result.turns[0]?.status, "failed");
     assert.equal(result.turns[0]?.retried, false);
+    assert.equal(await readRunLock(dir), null);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: an unexpected throw (BoundaryViolationError from assertNeutralCommits) still releases the lock", async () => {
+  // §8 acceptance criterion #12 explicitly requires lock release to be verified for "an
+  // unexpected throw", not only for the modelled RunResult-returning exit paths. run-loop.ts's own
+  // top-of-file comment states a `BoundaryViolationError` from `assertNeutralCommits` inside
+  // `runTurn` is "deliberately never caught anywhere in this module" and is left to propagate out
+  // of `runDispatch` itself -- so this is the one exit path where `runDispatch` throws rather than
+  // returning a `RunResult`. FM6/I4 both depend on the lock still being released here: a leaked
+  // lock on a boundary violation would deadlock every subsequent run against this repo.
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir);
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+
+    const runProcessFn: typeof runProcess = async () => {
+      // A commit carrying an AI-attribution trailer -- assertNeutralCommits (called inside
+      // runTurn, after ground-truth reconciliation) must reject this with BoundaryViolationError.
+      await commitFile(dir, "foo.txt", "v1\n", "turn0 (dirty)\n\nCo-Authored-By: Claude <noreply@anthropic.com>");
+      await writeHandoffRecord(
+        handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+        draft({ artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }] }),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    await assert.rejects(
+      runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight }),
+      (err: unknown) => {
+        assert.ok(err instanceof BoundaryViolationError);
+        return true;
+      },
+    );
+
+    // The lock must be released even though runDispatch threw rather than returning a RunResult.
     assert.equal(await readRunLock(dir), null);
   } finally {
     await cleanup(dir);

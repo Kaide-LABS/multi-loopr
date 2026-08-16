@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { BoundaryViolationError, InternalError } from "../domain/errors.ts";
+import { BoundaryViolationError, InternalError, IsolationLeakError, RelaySchemaError } from "../domain/errors.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
 import { writeHandoffRecord } from "../domain/relay.ts";
 import type { RawInvocationResult, TurnOutcome, TurnRequest } from "../domain/run.ts";
@@ -175,6 +175,65 @@ test("runTurn: a malformed on-disk record is converted into a modelled failure (
 
     assert.equal(result.outcome.ok, false);
     assert.equal(result.outcome.failure?.code, "RELAY_SCHEMA_INVALID");
+    assert.equal(result.record, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: an on-disk record carrying a transcript-shaped key is converted into a modelled failure (IsolationLeakError), not thrown", async () => {
+  // §8 acceptance criterion #21 requires a dedicated test proving IsolationLeakError (like
+  // RelaySchemaError) never triggers a retry -- both are caught in the same runTurn branch (step
+  // 6) and converted into an `outcome.ok: false` result, the uniform shape run-loop.ts's own
+  // single "no retry on !outcome.ok" branch handles identically regardless of error subtype.
+  const dir = await freshRepo();
+  try {
+    await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await mkdir(path.split("/").slice(0, -1).join("/"), { recursive: true });
+      // A minimal object carrying a forbidden (transcript-shaped) key -- assertNoTranscriptFields
+      // rejects this before schema_version/shape are ever checked.
+      await writeFile(path, JSON.stringify({ schema_version: 1, reasoning: "leaked chain of thought" }), "utf8");
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+
+    assert.equal(result.outcome.ok, false);
+    assert.ok(result.outcome.failure instanceof IsolationLeakError);
+    assert.equal(result.record, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: ground-truth reconciliation rejecting the record (R3: completed with zero real commits) is converted into a modelled failure (RelaySchemaError), not thrown", async () => {
+  // The reconciliation-time counterpart to the read-time RelaySchemaError test above -- §6.4 step
+  // 7's own catch clause, distinct from step 6's. §8 acceptance criterion #21 groups both under
+  // "a RelaySchemaError/IsolationLeakError from record read or reconciliation".
+  const dir = await freshRepo();
+  try {
+    await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      // The agent claims status: "completed" but makes no real commit -- ground truth will show
+      // zero commits between headBefore and HEAD, violating R3 once reconciliation applies it.
+      await writeHandoffRecord(
+        path,
+        draftFor(req, { branch: "main", head_before: "0".repeat(40), head_after: "1".repeat(40), commits: ["1".repeat(40)] }),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+
+    assert.equal(result.outcome.ok, false);
+    assert.ok(result.outcome.failure instanceof RelaySchemaError);
     assert.equal(result.record, null);
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
