@@ -1,0 +1,18 @@
+# context.md
+
+## Current state (single source of 'what's true now')
+- Mode: greenfield
+- Round reached: 6
+
+## Soft context (boss-said / watch-out / judged-a-failure-if)
+- _stated_: Yes -- real soft context, not a clean slate. The canonical archetype set for this build (supersedes earlier 3- and 4-archetype notes):
+
+1. ARCHITECT/CONTROLLER/DISPATCHER -- the persistent main session (this one). Owns the spec chain and scratch files, routes escalations, dispatches every other archetype. A router, not an adjudicator -- when a reviewer halts, the architect decides whether to escalate to the auditor and relays the verdict back, so escalation stays in one audit trail rather than agent-to-agent off the record. Operator-controlled, always the same provider/session -- not swapped across providers.
+2. RESEARCHER/PLANNER (Step 10) -- PRD modernization: verifies real versions/API signatures against current docs, escalates contradictions rather than silently resolving them. Model floor is non-negotiable and structural (a past incident: a weak model pinned an uninstallable dependency and declared success with no escalation). Does research/verification only -- does not own the spec chain, does not overrule a locked architectural decision, escalates to the human instead.
+3. EXECUTOR -- writes code against the spec it's given. Highest output volume; checked immediately downstream, which is why a low-effort tier is correct for it.
+4. REVIEWER -- verifies phase output against phase spec, generates the next phase spec. High verification effort is non-negotiable -- it IS the check. ISOLATION RULE: receives only the phase spec and the diff, never the executor's conversation/reasoning/justifications -- inheriting that context means inheriting its rationalizations. It flags, never overrules; the architect adjudicates.
+5. AUDITOR -- on-demand only, dispatched by the architect (never self-escalated by the reviewer) when the reviewer halts, or when an item touches a correctness-critical path regardless of confidence -- severity sets the ceiling, confidence is the gate, so a confidently-wrong reviewer doesn't silently swallow a false negative. Context-scoped to only the flagged items, their referenced spec clauses, and their referenced code -- never the whole project or the reviewer's conversation. Kept structurally separate from the architect so the persistent session doesn't need a heavier model just to cover rare escalations.
+
+PORTABILITY CONSTRAINT (load-bearing for multi-loopr specifically, not just loopr): archetype roles, escalation chain, isolation rules, dispatch gating, and model tiering must live in a host-agnostic layer, with the actual spawning mechanism (Claude Code subagent, Codex CLI invocation, etc.) behind an adapter. A port to a new provider must be a mechanism swap, not a redesign -- cheap now, expensive to retrofit. This also means model tiers should NOT be recorded as concrete Anthropic model names (Opus/Sonnet) directly on the role definitions -- that welds roles to mechanism the same way an unabstracted spawn call would. Record tier as an abstract property (e.g. verification-grade / high-volume-low-effort / research-grade), with each provider's adapter mapping that to its own concrete model/effort setting.
+
+V1 SCOPE IMPLICATION: defining five archetypes does not mean V1 instantiates all five -- V1 stays two agents, two providers, discipline running, context relay working end to end. The architect stays fixed as the current session; the auditor stays fully out of V1 (already reflected in the confirmed scope edges). Which of the remaining archetypes (researcher/executor/reviewer) actually cross-provider-dispatch in V1 is still an open call, not yet resolved.

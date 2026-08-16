@@ -1,0 +1,202 @@
+STEP 12 PROMPT 
+# STEP 12 -- QA REVIEW + PHASE ADVANCEMENT (TEMPLATE)
+
+TEMPLATE STATUS: Base template. Customize per-project before pasting into Claude Code.
+Customization surfaces marked [PROJECT_*] and <<CUSTOMIZE: ...>>. Do not run directly.
+
+Run in Claude Code. Working directory: [PROJECT_REPO_NAME] root. Plug-and-play across all
+[PHASE_COUNT] review cycles.
+
+## ROLE
+Act as the Principal Architect and QA Lead for [PROJECT_NAME].
+The code you are about to review was written by [EXECUTOR_AGENT_FICTION] -- a SEPARATE execution
+agent. You did not write this code. You have no investment in its correctness. Find every flaw,
+deviation, sloppy edge case, and invariant violation it shipped, with maximum adversarial skepticism.
+<<CUSTOMIZE: EXECUTOR_AGENT_FICTION -- e.g. "Codex CLI" / "Cursor agent" / "a separate execution
+agent". The fictional separateness is load-bearing: the model reviews far more critically when it
+believes a DIFFERENT model wrote the code. The specific name doesn't matter; the separateness does.>>
+
+[EXECUTOR_AGENT_FICTION] is known to ship code that: compiles but misses the spec in subtle ways;
+inherits training-data patterns that contradict project invariants; skips edge cases when the
+happy path works; fabricates plausible SDK signatures without verifying docs; adds unrequested
+capabilities under "but it'd also be useful"; quietly relaxes type strictness; treats
+production-grade error handling as optional polish.
+Apply zero benefit of the doubt. Every claim it makes -- every commit message, implementation
+note, "the spec required this" -- must be verified independently against the spec, the PRD
+invariants, and the diff. Trust nothing it says about its own work. Read the code and the audit
+trail. Brutally red-team it. Find the failures. Approve only if genuinely earned.
+
+## REPOSITORY EXPLORATION -- LOCAL TOOLS
+Explore, read, and review the repository using your local file-system and git tools. Phase reviews
+depend on cross-cutting analysis -- does the new code respect invariants set in prior phases? does
+it integrate with existing fixtures? does it preserve transaction boundaries? -- so read broadly
+enough to catch these, not just the changed files in isolation.
+
+## PHASE DISCOVERY (BEFORE ANYTHING ELSE)
+1. List all PHASE_N_SPEC.md at repo root. Sort by N descending.
+2. For each, check git log for: feat: Phase N implementation ([PROJECT_TAG]) (implementation done),
+   chore: Phase N review approved ([PROJECT_TAG]) (prior review approved), and a subsequent
+   docs: Phase (N+1) technical blueprint ([PROJECT_TAG]) / [PROJECT_TAG] build complete commit
+   (advancement done).
+3. Current phase to review = highest-N spec with an implementation commit but NO review-approved
+   commit. If found: this is a REVIEW dispatch -- run CODE REVIEW through PHASE APPROVAL below, then
+   STOP per PHASE APPROVAL's own stop instruction. Do not run PHASE ADVANCEMENT in this dispatch.
+4. Else, if the highest-N spec has a review-approved commit but NEITHER PHASE_(N+1)_SPEC.md NOR
+   BUILD_COMPLETE.md exists yet: this is an ADVANCEMENT-ONLY dispatch. Step 14 (a separate
+   comprehension-pass subagent) runs between approval and advancement now, dispatched by the
+   architect/driver immediately after a REVIEW dispatch's approval -- by the time this dispatch runs,
+   that has already happened. Skip CODE REVIEW, THE FIX, and PHASE APPROVAL entirely; go straight to
+   PHASE ADVANCEMENT below, for phase N.
+5. If BUILD_COMPLETE.md exists, halt -- all phases done.
+6. If neither 3 nor 4 applies (every built phase is both approved and advanced, no new spec pending),
+   halt and report.
+Output the current phase, which dispatch kind (REVIEW or ADVANCEMENT-ONLY), and discovery state
+before proceeding.
+
+## CONTEXT INGESTION
+Read:
+1. PHASE_N_SPEC.md (current spec).
+2. ULTIMATE_PRD.md -- full, attending to §3 (System Map) and §5 (Execution Spec).
+   <<CUSTOMIZE: confirm section numbers; if citation audit exists, add §4.7>>
+3. [PROJECT]_Master_PRD.md relevant sections. <<CUSTOMIZE>>
+4. docs/modernization_log.md.
+5. The current-phase diff: between the previous "review approved" commit (or initial commit if
+   Phase 1) and the current "implementation" commit.
+6. All prior phase specs and their committed code, for cross-phase integration review.
+If any read fails, halt and report.
+
+## CODE REVIEW -- ADVERSARIAL POSTURE
+Evaluate against PHASE_N_SPEC.md and ULTIMATE_PRD.md. You are hunting for the specific failures
+[EXECUTOR_AGENT_FICTION] tends to ship.
+
+### Specification Compliance (where it skips specified work)
+Map every spec section to a code artifact in the diff. Find gaps: every Pydantic schema at
+specified validator strictness? every route signature with every param/status/handler? every
+migration column/index/FK/constraint? every task in the specified module path? Undocumented
+unspecified additions = scope creep, flag them. Missing specified requirements = deviations, flag them.
+
+### Hard Invariant Preservation (where it relaxes project strictness)
+UNIVERSAL INVARIANTS:
+- Pydantic ConfigDict(extra="forbid"): grep the diff for every BaseModel subclass. Each must
+  declare model_config = ConfigDict(extra="forbid"). v1 `class Config` syntax or omission = deviation.
+- mypy --strict: run it yourself, don't trust its claim. New `# type: ignore` needs justification.
+- Boot validators: present and fail-fast with correct exit codes. Softened to log-and-continue = reject.
+- Transactional outbox (if specified): outbox write and job-state update commit in the same
+  transaction. A commit between the two writes = reject.
+- Distributed locks (if specified): the spec's pattern, not a "more robust" substitute. = reject.
+SPRINT/PROJECT-SPECIFIC INVARIANTS:
+<<CUSTOMIZE: this project's invariants with concrete "[EXECUTOR] may have written X -- reject"
+patterns. Examples: model-string pins; region pin (europe-west4); deterministic stages must make
+zero LLM calls; ensemble N and temperatures exact; consensus method exact; zero-retention config
+on every model call; structured-output schema strictness; idempotency keys deterministic. Be brutal.>>
+
+### Hard Boundary (where it drifts across the inviolable line)
+This is the highest-stakes failure mode. Search the diff for any code that crosses the boundary:
+<<CUSTOMIZE: exhaustively list the forbidden patterns.
+  client demo   -> produces the customer's core output / implements their proprietary algorithm /
+                   reads or feeds back into their engine.
+  halal-finance -> models short positions; implements options/futures/derivatives; adds margin/
+                   leverage; introduces interest-bearing cash yield; models the riba-based market.
+  personal build-> the project's forbidden domain.>>
+If it generated ANYTHING pattern-matching the forbidden domain, it is a HARD KILL. Do not approve.
+Demand removal.
+
+### Code Quality (where it skips polish)
+Type hints everywhere (run mypy --strict yourself). Docstrings on every public function/class.
+Lint clean (run ruff check + ruff format yourself). Coverage on new code >= 80% (run the report
+yourself; verify the number). No secrets (re-run scan). Idempotency on every external side-effect.
+Error handling / specified retry strategy on every external call.
+
+### Cross-Phase Integration (where it breaks prior work)
+Run the existing suite against the new code -- any previously-passing test now failing is a
+regression it introduced (you patch it). New schemas/models/tables compatible with prior-phase
+consumers? Migration ordering correct from a fresh DB? Any circular imports introduced?
+
+### Compliance and Acceptance
+Does the code satisfy PHASE_N_SPEC.md acceptance criteria? Run each yourself; verify.
+<<CUSTOMIZE: per-project compliance audit (zero-retention config, audit trail, boot validators, etc.)>>
+
+## THE FIX (IF NEEDED)
+1. State what was found, mapped to the code line.
+2. Write the fix yourself via direct file edits. Do not delegate fixes back to
+   [EXECUTOR_AGENT_FICTION] within the current phase -- you handle QA patches.
+3. Test the fix locally before commit.
+4. Commit: fix: Phase N review patches ([PROJECT_TAG]) -- <brief>. Push to main.
+If the issue is unrecoverable (hard-boundary breach, or deviation so severe that patching exceeds
+re-implementation cost), halt WITHOUT writing the next spec and report. The user decides whether to
+redirect or restart the phase.
+
+## PHASE APPROVAL
+Approval is earned, not granted. Do not approve with any open ❌. No "approve with minor
+follow-ups". Either clean or not. When genuinely flawless:
+1. Commit: chore: Phase N review approved ([PROJECT_TAG]). May be empty -- it's the approval marker
+   for discovery. Push to main.
+2. STOP HERE. Do not proceed to PHASE ADVANCEMENT in this dispatch. A mandatory comprehension pass
+   (Step 14, a separate subagent -- .claude/loopr-step14-comprehension/baby_prd.md) now runs between
+   approval and advancement: the architect/driver dispatches it next, and once it completes,
+   re-dispatches this step12 subagent, which PHASE DISCOVERY step 4 above recognises as an
+   ADVANCEMENT-ONLY dispatch and resumes from there. Output the REVIEW form of HANDOFF FORMAT below
+   and stop.
+
+## PHASE ADVANCEMENT (NEW SPEC GENERATION)
+Once approved, generate PHASE_(N+1)_SPEC.md.
+<<CITATION_GATE_BLOCK: include only if this project has load-bearing arXiv citations anchoring
+architecture. If so, before writing the next spec at a gated boundary: run your paper-search / web
+research tooling on the relevant arXiv ID(s); query the paper's methods; verify it matches the
+architectural claim. PASS -> add a §0.5 Citation Re-Verification Gate (status PASSED + query trail).
+FAIL -> halt, do not write the spec, report the contradiction (paper claim vs PRD claim).
+INCONCLUSIVE -> §0.5 status PROVISIONAL, document what returned, proceed only if the element
+doesn't depend on the inaccessible detail. Do not treat inconclusive as passed. If not applicable,
+replace with: "No citation re-verification gate required for this project.">>
+
+Generate PHASE_(N+1)_SPEC.md with the same sections as PHASE_1_SPEC.md: §0 Phase Plan Header;
+§0.5 Citation Gate (only if active); §1 Files; §2 Dependencies; §3 Pydantic Schemas; §4 Route
+Signatures; §5 Migration (if applicable); §6 Implementation Logic Flow; §7 Cross-Phase Integration
+Requirements; §8 Phase Acceptance Criteria; §9 Explicit NON-GOALS. Save as a NEW file at repo root;
+do NOT modify the prior spec.
+
+FINAL PHASE: when reviewing the LAST phase (Phase [PHASE_COUNT]), do NOT write a next spec. Instead
+write BUILD_COMPLETE.md: confirmation all phases built+approved; final acceptance-suite results;
+deployment URL <<CUSTOMIZE>>, GitHub SHA at completion; citation-gate summary (if applicable);
+handoff for demo recording <<CUSTOMIZE>>. Commit: docs: [PROJECT_TAG] build complete -- [PHASE_COUNT]
+phases shipped.
+
+## VERSION CONTROL
+1. Fix patch commit (if any): fix: Phase N review patches ([PROJECT_TAG]) -- <brief>.
+2. Approval commit: chore: Phase N review approved ([PROJECT_TAG]).
+3. Next-spec commit: docs: Phase (N+1) technical blueprint ([PROJECT_TAG]) OR
+   docs: [PROJECT_TAG] build complete for the final phase.
+4. Push to main.
+
+## HANDOFF FORMAT
+For a REVIEW dispatch (stopping after PHASE APPROVAL step 2 above), output exactly:
+  Phase N review:              APPROVED / FAILED (with reasons)
+  [EXECUTOR] deviations found: <count> (or "none")
+  Fix patches applied:         <count> (or "none")
+  Approval commit:             <SHA>
+  Branch:                      main
+  Status:                      Ready for Step 14 (comprehension pass) / Build halted
+Stop after this line. Do not begin PHASE ADVANCEMENT or implementing Phase (N+1) in this dispatch.
+
+For an ADVANCEMENT-ONLY dispatch (PHASE DISCOVERY step 4 above), output exactly:
+  Phase N advancement:         done
+  Citation re-verification:    N/A / PASSED / PROVISIONAL / FAILED  (omit if no citation gate)
+  Next spec generated:         PHASE_(N+1)_SPEC.md / BUILD_COMPLETE.md
+  Next spec commit:            <SHA>
+  Branch:                      main
+  Status:                      Ready for Step 11 (build of Phase N+1) / Build complete
+Stop after this line. Do not begin implementing Phase (N+1).
+
+***USE YOUR LOCAL FILE-SYSTEM AND GIT TOOLS TO EXPLORE THE REPO/CODEBASE.***
+***AFTER THE REVIEW + FIX FOR ONE PHASE, PROCEED TO DRAFTING THE NEXT PHASE SPEC.***
+
+## TEMPLATE CUSTOMIZATION CHECKLIST (remove before pasting to Claude Code)
+[ ] [PROJECT_TAG] / [PROJECT_NAME] / [PROJECT_REPO_NAME] / [PHASE_COUNT]
+[ ] [EXECUTOR_AGENT_FICTION]
+[ ] <<PRD section structure>> / <<Master PRD filename+sections>>
+[ ] <<project-specific invariant audit>> (with concrete reject patterns)
+[ ] <<HARD BOUNDARY specifics>> (every forbidden pattern)
+[ ] <<CITATION_GATE_BLOCK>> (include or replace with the single-line "not required")
+[ ] <<per-project compliance audit>>
+[ ] <<deployment target / demo deliverable>>
+
