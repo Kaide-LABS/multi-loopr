@@ -5,7 +5,7 @@
 // Phase 1 is a scope violation (PHASE_1_SPEC.md §9, non-goal #1).
 
 import type { ModelTier } from "../domain/tiers.ts";
-import type { ProviderId, RawInvocationResult, TurnOutcome, TurnRequest } from "../domain/run.ts";
+import type { AuthProbeState, ProviderId, RawInvocationResult, TurnOutcome, TurnRequest } from "../domain/run.ts";
 
 /**
  * A fully-specified child-process invocation, ready to hand to `runProcess()`
@@ -37,7 +37,16 @@ export interface PreflightReport {
   readonly cliFound: boolean;
   readonly version: string | null;
   readonly versionInRange: boolean;
+  /**
+   * `true` iff {@link authState} is `"authenticated"` -- exactly the meaning this field has always
+   * had ("definitively authenticated"). Both of the other two states report `false` here, so every
+   * consumer written against this boolean alone (including the `doctor --json` schema's own
+   * `providers[].authenticated`) keeps its prior behaviour byte-for-byte. {@link authState} is the
+   * additive discriminant that tells "genuinely not signed in" apart from "the probe failed".
+   */
   readonly authenticated: boolean;
+  /** Which of the three real probe outcomes produced {@link authenticated}. */
+  readonly authState: AuthProbeState;
   /** Empty array => healthy. */
   readonly problems: readonly string[];
 }

@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { ExitCode, LockHeldError } from "../domain/errors.ts";
 import { IsoUtc } from "../domain/relay.ts";
-import { ProviderIdSchema } from "../domain/run.ts";
+import { AuthProbeStateSchema, ProviderIdSchema } from "../domain/run.ts";
 import type { PreflightReport } from "../ports/provider-adapter.ts";
 import type { BoundaryViolation } from "../verify/boundary.ts";
 import { listScannedSourceFiles, scanBoundary } from "../verify/boundary.ts";
@@ -28,7 +28,13 @@ const PreflightReportSchema = z.strictObject({
   cliFound: z.boolean(),
   version: z.string().nullable(),
   versionInRange: z.boolean(),
+  // `authenticated` keeps its shipped meaning exactly: `true` iff definitively authenticated. Every
+  // consumer already written against it is unaffected. `authState` is purely additive -- it splits
+  // the `false` case into the two claims that were previously indistinguishable ("the CLI says you
+  // are signed out" vs. "the probe never got an answer"), which is a new field on an existing
+  // report, not a new report shape. Hence no `schema_version` bump.
   authenticated: z.boolean(),
+  authState: AuthProbeStateSchema,
   problems: z.array(z.string()),
 });
 

@@ -171,7 +171,33 @@ function parseArgs(argv: readonly string[]): Command {
   throw new UsageError(`Unknown command: ${args.join(" ")}`, { argv: args });
 }
 
-function renderHumanReport(report: DoctorReport): string {
+/**
+ * The operator-facing phrasing of one provider's credential state. The whole point of the
+ * three-state {@link DoctorReport} `authState` is that these three strings give *different
+ * instructions*: "not authenticated" means go sign in, whereas an indeterminate probe means the
+ * check itself did not work and neither answer should be trusted. Rendering both as the same
+ * "not authenticated" line -- as this command did before -- sends an operator chasing a sign-in
+ * problem that does not exist while the real defect stays invisible.
+ */
+function renderAuthState(report: DoctorReport["providers"][number]): string {
+  switch (report.authState) {
+    case "authenticated":
+      return "authenticated";
+    case "unauthenticated":
+      return "not authenticated";
+    case "indeterminate":
+      return "auth state UNKNOWN (credential probe was inconclusive -- NOT a confirmed sign-in failure)";
+  }
+}
+
+/**
+ * Renders a {@link DoctorReport} as the human-readable `doctor` output. Exported solely so the
+ * three-way credential-state rendering can be asserted against literally-constructed reports (the
+ * indeterminate state cannot be provoked from a real local probe on demand) -- the same "test the
+ * pure interpretation with a constructed input" approach `src/verify/preflight.ts`'s `parse*`
+ * functions already use.
+ */
+export function renderHumanReport(report: DoctorReport): string {
   const lines: string[] = [];
   lines.push(`multi-loopr doctor -- ${report.ok ? "OK" : "PROBLEMS FOUND"} (generated ${report.generated_at})`);
   lines.push("");
@@ -187,7 +213,7 @@ function renderHumanReport(report: DoctorReport): string {
     lines.push(
       `${p.provider}: ${p.cliFound ? (p.version ?? "unknown") : "not found"} ` +
         `(${p.versionInRange ? "in range" : "out of range"}), ` +
-        `${p.authenticated ? "authenticated" : "not authenticated"}`,
+        renderAuthState(p),
     );
   }
   lines.push(

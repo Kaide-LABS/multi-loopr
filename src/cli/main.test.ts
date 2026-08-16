@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import pkg from "../../package.json" with { type: "json" };
 import { runProcess } from "../util/exec.ts";
 import { DoctorReport } from "./doctor.ts";
+import { renderHumanReport } from "./main.ts";
 
 const MAIN_TS_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const RUN_TIMEOUT_MS = 30_000;
@@ -103,6 +104,68 @@ test("doctor --providers exits 3 on this machine and names Codex specifically wi
   assert.equal(codex?.authenticated, false);
   assert.ok(codex && codex.problems.length > 0, "expected codex-cli to carry at least one problem");
   assert.ok(report.problems.some((p) => p.includes("Codex")), "expected a problem naming Codex specifically");
+});
+
+/**
+ * A minimal, valid {@link DoctorReport} carrying exactly one provider in the requested credential
+ * state. Constructed literally (never probed) because an indeterminate probe cannot be provoked
+ * from this machine's real CLIs on demand -- the same constructed-input approach `preflight.test.ts`
+ * uses for the `parse*` functions.
+ */
+function reportWithAuthState(authState: "authenticated" | "unauthenticated" | "indeterminate"): DoctorReport {
+  return DoctorReport.parse({
+    schema_version: 1,
+    generated_at: "2026-08-16T00:00:00.000Z",
+    ok: authState === "authenticated",
+    exit_code: authState === "authenticated" ? 0 : 3,
+    toolchain: {
+      node: { found: true, version: "24.0.0", inRange: true },
+      git: { found: true, version: "2.54.0", inRange: true },
+    },
+    providers: [
+      {
+        provider: "codex-cli",
+        cliFound: true,
+        version: "codex-cli 0.128.0",
+        versionInRange: true,
+        authenticated: authState === "authenticated",
+        authState,
+        problems: [],
+      },
+    ],
+    boundary: { filesScanned: 0, violations: [] },
+    lock: { acquirable: true, detail: "not checked" },
+    problems: [],
+  });
+}
+
+test("DoctorReport rejects a providers[] entry with no authState (the new field is part of the schema)", () => {
+  const valid = reportWithAuthState("unauthenticated");
+  const provider = valid.providers[0];
+  assert.ok(provider !== undefined);
+  const { authState: _dropped, ...withoutAuthState } = provider;
+  assert.equal(DoctorReport.safeParse({ ...valid, providers: [withoutAuthState] }).success, false);
+});
+
+test("doctor's human-readable output distinguishes an indeterminate probe from a genuine sign-in failure", () => {
+  const unauthenticated = renderHumanReport(reportWithAuthState("unauthenticated"));
+  const indeterminate = renderHumanReport(reportWithAuthState("indeterminate"));
+  const authenticated = renderHumanReport(reportWithAuthState("authenticated"));
+
+  // The whole point: three states, three distinct operator-facing lines.
+  assert.notEqual(indeterminate, unauthenticated);
+  assert.notEqual(indeterminate, authenticated);
+  assert.notEqual(unauthenticated, authenticated);
+
+  assert.match(unauthenticated, /codex-cli: .*not authenticated/);
+  assert.match(indeterminate, /codex-cli: .*UNKNOWN/);
+  // An indeterminate result must never render as the sign-in-failure wording, or an operator will
+  // chase a credential problem that does not exist (the Windows cmd.exe defect's exact symptom).
+  assert.doesNotMatch(indeterminate, /not authenticated/);
+  assert.match(indeterminate, /NOT a confirmed sign-in failure/);
+
+  // The `authenticated` line stays byte-identical to what it has always been.
+  assert.match(authenticated, /codex-cli: codex-cli 0\.128\.0 \(in range\), authenticated\n/);
 });
 
 test("doctor (no flags) runs the full report and exits per §4.3 precedence", async () => {

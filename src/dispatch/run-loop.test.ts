@@ -39,8 +39,8 @@ function fakeHealthyPreflight(): Promise<PreflightSummary> {
     node: { found: true, version: "24.15.0", inRange: true },
     git: { found: true, version: "2.54.0", inRange: true },
     providers: [
-      { provider: "claude-code", cliFound: true, version: "2.1.211", versionInRange: true, authenticated: true, problems: [] },
-      { provider: "codex-cli", cliFound: true, version: "0.128.0", versionInRange: true, authenticated: true, problems: [] },
+      { provider: "claude-code", cliFound: true, version: "2.1.211", versionInRange: true, authenticated: true, authState: "authenticated", problems: [] },
+      { provider: "codex-cli", cliFound: true, version: "0.128.0", versionInRange: true, authenticated: true, authState: "authenticated", problems: [] },
     ],
     ok: true,
     problems: [],
@@ -126,7 +126,7 @@ class RecordingFakeAdapter implements ProviderAdapter {
     this.id = id;
   }
   preflight(): Promise<PreflightReport> {
-    return Promise.resolve({ provider: this.id, cliFound: true, version: "1.0.0", versionInRange: true, authenticated: true, problems: [] });
+    return Promise.resolve({ provider: this.id, cliFound: true, version: "1.0.0", versionInRange: true, authenticated: true, authState: "authenticated", problems: [] });
   }
   resolveEffort(): string {
     return "low";

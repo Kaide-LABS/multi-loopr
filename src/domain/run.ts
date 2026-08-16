@@ -43,6 +43,32 @@ export type ProviderId = (typeof PROVIDER_IDS)[number];
 export const ProviderIdSchema = z.enum(PROVIDER_IDS);
 
 /**
+ * The three genuinely distinct outcomes of *observing* a provider CLI's credential state (boundary
+ * rule B6 -- multi-loopr only ever observes it, never establishes it):
+ *
+ * - `"authenticated"` -- the CLI ran and its own output positively says the operator is signed in.
+ * - `"unauthenticated"` -- the CLI ran fine and its own output positively says the operator is not
+ *   signed in (Claude Code's `loggedIn: false`; Codex's documented not-signed-in exit code with no
+ *   API key env var set). A **claim**, and an actionable one: the operator needs to sign in.
+ * - `"indeterminate"` -- the probe did not answer the question: the child process failed to spawn,
+ *   timed out, returned an exit code matching neither documented outcome, or emitted output that
+ *   did not parse. The **absence** of a claim, and a different action: look closer.
+ *
+ * Collapsing the last two into a single `false` is exactly the shape that let the Windows `cmd.exe`
+ * argument-quoting defect (fixed in `src/util/exec.ts`) stay invisible: a probe failing for a reason
+ * entirely unrelated to credentials read identically to "not signed in", so `doctor --providers`
+ * reported a plausible-looking provider state right up until a real turn silently failed. A probe
+ * that cannot answer must say so rather than guess the more familiar answer.
+ */
+export const AUTH_PROBE_STATES = ["authenticated", "unauthenticated", "indeterminate"] as const;
+
+/** A member of {@link AUTH_PROBE_STATES}. */
+export type AuthProbeState = (typeof AUTH_PROBE_STATES)[number];
+
+/** zod schema for {@link AuthProbeState}. */
+export const AuthProbeStateSchema = z.enum(AUTH_PROBE_STATES);
+
+/**
  * Operator-supplied run configuration. Phase 1 defines and validates it; Phase 3's dispatch loop
  * is its only consumer.
  */

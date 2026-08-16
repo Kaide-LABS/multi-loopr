@@ -93,11 +93,14 @@ test("parseClaudeAuthResult: exit 0 with loggedIn: true -> authenticated", () =>
     fakeResult({ exitCode: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }) }),
   );
   assert.equal(parsed.authenticated, true);
+  assert.equal(parsed.authState, "authenticated");
 });
 
 test("parseClaudeAuthResult: exit 0 with loggedIn: false -> not authenticated", () => {
   const parsed = parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify({ loggedIn: false }) }));
   assert.equal(parsed.authenticated, false);
+  // The CLI ran fine and its own output answered the question: a real claim, not a probe failure.
+  assert.equal(parsed.authState, "unauthenticated");
 });
 
 test("parseClaudeAuthResult: non-JSON stdout -> unauthenticated, not a crash", () => {
@@ -106,30 +109,98 @@ test("parseClaudeAuthResult: non-JSON stdout -> unauthenticated, not a crash", (
   assert.match(parsed.detail, /unrecognised/);
 });
 
+test("parseClaudeAuthResult: malformed (non-JSON) stdout is INDETERMINATE, not a sign-in failure", () => {
+  const parsed = parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: "not json at all" }));
+  assert.equal(parsed.authState, "indeterminate");
+  // Previously indistinguishable from the genuine loggedIn: false case above; now it is not.
+  const genuine = parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify({ loggedIn: false }) }));
+  assert.notEqual(parsed.authState, genuine.authState);
+  assert.equal(parsed.authenticated, genuine.authenticated, "both still report authenticated: false");
+});
+
+test("parseClaudeAuthResult: valid JSON with no loggedIn boolean is INDETERMINATE", () => {
+  const parsed = parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify({ authMethod: "claude.ai" }) }));
+  assert.equal(parsed.authState, "indeterminate");
+  assert.equal(parsed.authenticated, false);
+});
+
+test("parseClaudeAuthResult: JSON that is not an object (a bare string) is INDETERMINATE", () => {
+  const parsed = parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify("ok") }));
+  assert.equal(parsed.authState, "indeterminate");
+  assert.equal(parsed.authenticated, false);
+});
+
 test("parseClaudeAuthResult: non-zero exit -> not authenticated", () => {
   const parsed = parseClaudeAuthResult(fakeResult({ exitCode: 1, stdout: "" }));
   assert.equal(parsed.authenticated, false);
 });
 
+test("parseClaudeAuthResult: an unexpected exit code is INDETERMINATE (the CLI's verified shape is exit 0 either way)", () => {
+  for (const exitCode of [1, 2, 127]) {
+    const parsed = parseClaudeAuthResult(fakeResult({ exitCode, stdout: "" }));
+    assert.equal(parsed.authState, "indeterminate", `exit ${String(exitCode)} should be indeterminate`);
+    assert.equal(parsed.authenticated, false);
+  }
+});
+
+test("parseClaudeAuthResult: a timed-out probe is INDETERMINATE", () => {
+  const parsed = parseClaudeAuthResult(fakeResult({ exitCode: null, signal: "SIGTERM", timedOut: true }));
+  assert.equal(parsed.authState, "indeterminate");
+  assert.equal(parsed.authenticated, false);
+  assert.match(parsed.detail, /timed out/);
+});
+
 test("parseClaudeAuthResult: CLI absent (ENOENT-shaped result) -> not authenticated, no crash", () => {
   const parsed = parseClaudeAuthResult(fakeResult({ exitCode: null, stdout: "", stderr: "spawn claude ENOENT" }));
   assert.equal(parsed.authenticated, false);
+  // A failed spawn says nothing whatsoever about credentials.
+  assert.equal(parsed.authState, "indeterminate");
 });
 
 test("parseCodexAuthResult: exit 0 -> authenticated regardless of stdout shape", () => {
   const parsed = parseCodexAuthResult(fakeResult({ exitCode: 0, stdout: "" }), {});
   assert.equal(parsed.authenticated, true);
+  assert.equal(parsed.authState, "authenticated");
 });
 
 test("parseCodexAuthResult: non-zero exit, no API key env var -> not authenticated", () => {
   const parsed = parseCodexAuthResult(fakeResult({ exitCode: 1, stdout: "Not logged in" }), {});
   assert.equal(parsed.authenticated, false);
+  // Exit 1 is this CLI's documented, locally-verified not-signed-in result: a real claim.
+  assert.equal(parsed.authState, "unauthenticated");
+});
+
+test("parseCodexAuthResult: an exit code matching neither documented outcome is INDETERMINATE", () => {
+  // This is the exact class of result the Windows cmd.exe relaunch fallback could surface from the
+  // launcher shim rather than from the CLI itself -- the failure mode that made a broken probe read
+  // identically to a genuinely signed-out provider.
+  const genuine = parseCodexAuthResult(fakeResult({ exitCode: 1, stdout: "Not logged in" }), {});
+  for (const exitCode of [2, 9009, 127]) {
+    const parsed = parseCodexAuthResult(fakeResult({ exitCode, stderr: "'codex' is not recognized" }), {});
+    assert.equal(parsed.authState, "indeterminate", `exit ${String(exitCode)} should be indeterminate`);
+    assert.notEqual(parsed.authState, genuine.authState);
+    assert.equal(parsed.authenticated, false, "the shipped boolean contract is unchanged");
+    assert.match(parsed.detail, /neither/);
+  }
+});
+
+test("parseCodexAuthResult: a timed-out probe is INDETERMINATE, not signed out", () => {
+  const parsed = parseCodexAuthResult(fakeResult({ exitCode: null, signal: "SIGTERM", timedOut: true }), {});
+  assert.equal(parsed.authState, "indeterminate");
+  assert.equal(parsed.authenticated, false);
+  assert.match(parsed.detail, /timed out/);
 });
 
 test("parseCodexAuthResult: non-zero exit, CODEX_API_KEY set -> authenticated via env var", () => {
   const parsed = parseCodexAuthResult(fakeResult({ exitCode: 1 }), { CODEX_API_KEY: "sk-fake-for-test" });
   assert.equal(parsed.authenticated, true);
+  assert.equal(parsed.authState, "authenticated");
   assert.match(parsed.detail, /API key/);
+});
+
+test("parseCodexAuthResult: a BYOA env var wins even over an otherwise-indeterminate exit code", () => {
+  const parsed = parseCodexAuthResult(fakeResult({ exitCode: 9009 }), { OPENAI_API_KEY: "sk-fake-for-test" });
+  assert.equal(parsed.authState, "authenticated");
 });
 
 test("parseCodexAuthResult: non-zero exit, OPENAI_API_KEY set -> authenticated via env var", () => {
@@ -140,6 +211,24 @@ test("parseCodexAuthResult: non-zero exit, OPENAI_API_KEY set -> authenticated v
 test("parseCodexAuthResult: CLI absent (ENOENT-shaped result), no env var -> not authenticated, no crash", () => {
   const parsed = parseCodexAuthResult(fakeResult({ exitCode: null, stderr: "spawn codex ENOENT" }), {});
   assert.equal(parsed.authenticated, false);
+  assert.equal(parsed.authState, "indeterminate");
+});
+
+test("both parsers keep the shipped invariant: authenticated === true iff authState === \"authenticated\"", () => {
+  const cases = [
+    parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify({ loggedIn: true }) })),
+    parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: JSON.stringify({ loggedIn: false }) })),
+    parseClaudeAuthResult(fakeResult({ exitCode: 0, stdout: "garbage" })),
+    parseClaudeAuthResult(fakeResult({ exitCode: 3 })),
+    parseCodexAuthResult(fakeResult({ exitCode: 0 }), {}),
+    parseCodexAuthResult(fakeResult({ exitCode: 1 }), {}),
+    parseCodexAuthResult(fakeResult({ exitCode: 42 }), {}),
+    parseCodexAuthResult(fakeResult({ exitCode: 1 }), { CODEX_API_KEY: "sk-fake-for-test" }),
+  ];
+  for (const c of cases) {
+    assert.equal(c.authenticated, c.authState === "authenticated", `drift for authState "${c.authState}"`);
+    assert.notEqual(c.detail, "");
+  }
 });
 
 test("runPreflight always probes both providers, even though on this machine only one is authenticated", async () => {
@@ -157,6 +246,10 @@ test("runPreflight always probes both providers, even though on this machine onl
     const codex = summary.providers.find((p) => p.provider === "codex-cli");
     assert.equal(claude?.authenticated, true);
     assert.equal(codex?.authenticated, false);
+    assert.equal(claude?.authState, "authenticated");
+    // Codex reports its own documented not-signed-in result here, so this is a real claim rather
+    // than a failed probe -- the distinction the authState field exists to make.
+    assert.equal(codex?.authState, "unauthenticated");
     assert.equal(summary.ok, false);
     assert.ok(summary.problems.some((p) => p.includes("Codex")));
   } finally {
