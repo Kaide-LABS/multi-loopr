@@ -9,6 +9,7 @@ import { z } from "zod";
 import { UsageError } from "../domain/errors.ts";
 import { HaltSignal, IsoUtc, RunId } from "../domain/relay.ts";
 import { ProviderIdSchema, RunConfig } from "../domain/run.ts";
+import type { RunDispatchDeps } from "../dispatch/run-loop.ts";
 import { runDispatch } from "../dispatch/run-loop.ts";
 
 /** The `run --json` output shape (PHASE_3_SPEC.md §3.5). Mirrors `DoctorReport`'s own shape. */
@@ -49,8 +50,18 @@ export interface RunCommandOptions {
  * reserved for the inter-agent `HandoffRecord` payload specifically; a malformed operator-supplied
  * run config is squarely "the CLI invocation itself was malformed." Implements
  * PHASE_3_SPEC.md §6.6.
+ *
+ * `deps` is threaded straight through as `runDispatch()`'s own second `deps` argument, mirroring
+ * `runDispatch`'s own `RunDispatchDeps` injection seam one level up rather than inventing a new
+ * one. It defaults to `undefined` (i.e. `runDispatch`'s real production deps: real `runPreflight`,
+ * real `ADAPTER_REGISTRY`, real `runProcess`) when the caller doesn't supply it, so
+ * `src/cli/main.ts`'s real-world call site -- which never passes `deps` -- is byte-identical to
+ * before this parameter existed. This is a test seam only, not a behaviour change.
  */
-export async function runRunCommand(opts: RunCommandOptions): Promise<{ report: RunReport; exitCode: number }> {
+export async function runRunCommand(
+  opts: RunCommandOptions,
+  deps?: RunDispatchDeps,
+): Promise<{ report: RunReport; exitCode: number }> {
   let text: string;
   try {
     text = await readFile(opts.configPath, "utf8");
@@ -80,7 +91,7 @@ export async function runRunCommand(opts: RunCommandOptions): Promise<{ report: 
   }
   const config = result.data;
 
-  const dispatchResult = await runDispatch(config);
+  const dispatchResult = await runDispatch(config, deps);
 
   const report: RunReport = {
     schema_version: 1,
