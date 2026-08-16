@@ -20,6 +20,7 @@ export const ExitCode = {
   BOUNDARY_VIOLATION: 7,
   LOCK_HELD: 8,
   TIER_WELDING: 9,
+  TURN_TIMEOUT: 10,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */
@@ -94,6 +95,17 @@ export class LockHeldError extends MultiLooprError {
 export class TierWeldingError extends MultiLooprError {
   readonly exitCode = ExitCode.TIER_WELDING;
   readonly code = "TIER_WELDING";
+}
+
+/**
+ * A turn's child process ran past `TurnRequest.timeoutMs` and was killed (PRD §9 FM7). Distinct
+ * from {@link InternalError}: a turn timeout is a modelled condition an adapter's
+ * `interpretResult()` must recognise unconditionally, not an unexpected internal failure.
+ * Implements PHASE_2_SPEC.md §1.2.
+ */
+export class TurnTimeoutError extends MultiLooprError {
+  readonly exitCode = ExitCode.TURN_TIMEOUT;
+  readonly code = "TURN_TIMEOUT";
 }
 
 /**

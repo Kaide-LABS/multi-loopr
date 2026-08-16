@@ -14,6 +14,17 @@ import type { ProviderId, RawInvocationResult, TurnOutcome, TurnRequest } from "
 export interface Invocation {
   readonly command: string;
   readonly args: readonly string[];
+  /**
+   * An **additive overlay**, not a full replacement: whatever process actually spawns this
+   * invocation (Phase 3's dispatch loop, via `runProcess()`) must construct the child's
+   * environment as `{ ...process.env, ...invocation.env }`, never as `invocation.env` alone. This
+   * is what lets `buildInvocation` stay pure (per this interface's own doc comment: "no
+   * environment read beyond what `req` already carries") while the provider CLI still inherits
+   * the operator's ambient PATH, credentials, and shell environment at actual spawn time. An
+   * adapter returns a non-empty `env` only for values it must deterministically force (none
+   * needed by either Phase 2 adapter -- see `src/adapters/claude-code.ts` / `codex-cli.ts`).
+   * Implements PHASE_2_SPEC.md §1.4.
+   */
   readonly env: Readonly<Record<string, string>>;
   readonly cwd: string;
   /** `null` => stdin is closed immediately, never inherited from the parent TTY (PRD §9 FM7). */

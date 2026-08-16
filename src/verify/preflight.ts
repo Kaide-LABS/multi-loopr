@@ -223,6 +223,45 @@ function authRemediation(id: ProviderId): string {
 }
 
 /**
+ * Assembles a single provider's {@link PreflightReport}: CLI presence/version, then (only if the
+ * CLI was found) its auth state, then the derived `problems` list. This is the exact per-provider
+ * block `runPreflight()`'s loop body computed inline in Phase 1, lifted out unchanged so both
+ * `runPreflight()` (§below) and each Phase 2 `ProviderAdapter.preflight()` (`src/adapters/*.ts`)
+ * assemble a provider's health from this single place -- never two independently-maintained
+ * copies of the same version-range/auth-interpretation logic (PRD §9 FM9). Implements
+ * PHASE_2_SPEC.md §1.5/§6.5.
+ */
+export async function buildProviderPreflightReport(id: ProviderId): Promise<PreflightReport> {
+  const cli = await checkProviderCli(id);
+  const range = PROVIDER_VERSION_RANGES[id];
+  const versionInRange = cli.version !== null && inRange(cli.version, range.min, range.maxExclusive);
+  const auth = cli.found
+    ? await checkProviderAuth(id)
+    : { authenticated: false, detail: "CLI not found; auth probe skipped" };
+
+  const reportProblems: string[] = [];
+  if (!cli.found) {
+    reportProblems.push(notFoundRemediation(id));
+  } else if (!versionInRange) {
+    reportProblems.push(
+      `${id}: version ${cli.version ?? "unknown"} is outside the required range [${range.min}, ${range.maxExclusive}).`,
+    );
+  }
+  if (cli.found && !auth.authenticated) {
+    reportProblems.push(authRemediation(id));
+  }
+
+  return {
+    provider: id,
+    cliFound: cli.found,
+    version: cli.version,
+    versionInRange,
+    authenticated: auth.authenticated,
+    problems: reportProblems,
+  };
+}
+
+/**
  * Runs every toolchain and provider check and assembles a {@link PreflightSummary}. Always probes
  * **both** providers, even if the first fails, so a single run reports every problem at once.
  */
@@ -248,34 +287,9 @@ export async function runPreflight(repoDir: string): Promise<PreflightSummary> {
 
   const providers: PreflightReport[] = [];
   for (const id of PROVIDER_IDS) {
-    const cli = await checkProviderCli(id);
-    const range = PROVIDER_VERSION_RANGES[id];
-    const versionInRange = cli.version !== null && inRange(cli.version, range.min, range.maxExclusive);
-    const auth = cli.found
-      ? await checkProviderAuth(id)
-      : { authenticated: false, detail: "CLI not found; auth probe skipped" };
-
-    const reportProblems: string[] = [];
-    if (!cli.found) {
-      reportProblems.push(notFoundRemediation(id));
-    } else if (!versionInRange) {
-      reportProblems.push(
-        `${id}: version ${cli.version ?? "unknown"} is outside the required range [${range.min}, ${range.maxExclusive}).`,
-      );
-    }
-    if (cli.found && !auth.authenticated) {
-      reportProblems.push(authRemediation(id));
-    }
-
-    providers.push({
-      provider: id,
-      cliFound: cli.found,
-      version: cli.version,
-      versionInRange,
-      authenticated: auth.authenticated,
-      problems: reportProblems,
-    });
-    problems.push(...reportProblems);
+    const report = await buildProviderPreflightReport(id);
+    providers.push(report);
+    problems.push(...report.problems);
   }
 
   const ok = node.inRange && git.inRange && providers.every((p) => p.problems.length === 0);

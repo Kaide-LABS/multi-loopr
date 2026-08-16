@@ -55,6 +55,13 @@ export interface TurnRequest {
   readonly archetype: Archetype;
   readonly provider: ProviderId;
   readonly tier: ModelTier;
+  /**
+   * Operator-supplied override from `RunConfig.model_overrides` (PHASE_1_SPEC.md §3.5) -- "the
+   * only place a concrete model name may appear at runtime, and it is operator-supplied data,
+   * never source." `null` when the operator did not override this provider's model for this run.
+   * Implements PHASE_2_SPEC.md §1.3.
+   */
+  readonly modelOverride: string | null;
   readonly repoDir: string;
   readonly specRef: FileRef;
   readonly priorRecord: HandoffRecord | null;
