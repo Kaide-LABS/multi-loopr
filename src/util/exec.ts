@@ -13,10 +13,29 @@
 // claude` resolves it to `...\npm\claude.cmd`]. `shell: false` for the primary spawn stays exactly
 // as specified (arguments are never handed to a shell for metacharacter interpretation). The
 // narrow fallback below only engages when that primary spawn fails with `ENOENT` on `win32`, and
-// only relaunches through `cmd.exe /d /s /c` when every argument is already free of cmd.exe's own
-// metacharacters -- so the fallback lets cmd.exe do its own PATH+PATHEXT resolution (finding the
-// `.cmd` shim, exactly as a human typing the same command at a prompt would) without reintroducing
-// shell-injection risk through argument content.
+// relaunches through `cmd.exe /d /s /v:OFF /c` -- so the fallback lets cmd.exe do its own
+// PATH+PATHEXT resolution (finding the `.cmd` shim, exactly as a human typing the same command at
+// a prompt would) without reintroducing shell-injection risk through argument content.
+//
+// Why the fallback builds the command line itself (bug fix; see `buildWindowsCmdRelaunch`): the
+// fallback originally passed `["/d", "/s", "/c", command, ...args]` as a normal argv array with
+// `shell: false`, and simply *refused* to engage whenever any argument contained one of
+// `& | < > ^ % " \r \n`. Both halves of that were wrong for arguments containing `"`:
+//
+//   * Node/libuv quote an argv array using the MSVCRT/`CommandLineToArgvW` convention, in which an
+//     embedded quote is escaped as `\"`. cmd.exe has never understood `\"` -- it is a *different*
+//     grammar, and it tracks quote state by counting raw `"` characters. Handing a `\"`-escaped
+//     line to `cmd /c` therefore desynchronises cmd's quote parity, which is precisely the
+//     dialect mismatch behind CVE-2024-27980 / CVE-2024-24576 ("BatBadBut").
+//   * The blanket refusal meant the `codex` adapter -- whose `-c key="value"` config overrides
+//     unavoidably contain literal `"` (Codex's own documented override syntax) -- could never be
+//     relaunched at all, so every real Codex turn failed with `ENOENT` on Windows while
+//     `doctor --providers` still reported it healthy (its preflight probes use unquoted args).
+//
+// The fix builds the full cmd.exe command line as one correctly-escaped string and spawns it with
+// `windowsVerbatimArguments: true`, bypassing libuv's argv quoting entirely. See
+// `quoteForWindowsCommandLine` for the escaping rule and `CMD_IRREDUCIBLY_UNSAFE_CHARS` for the
+// (now much narrower, but still genuinely fail-safe) set of characters the fallback still refuses.
 //
 // exitCode:null caveat on the fallback path (disclosed in Step 12's adversarial review, approved
 // commit e389620): PHASE_1_SPEC.md §6.1's contract that a spawn error resolves with
@@ -81,11 +100,102 @@ function appendChunk(
   return { bytes: state.bytes + chunk.length, truncated: false };
 }
 
-/** cmd.exe metacharacters that must never appear in an argument relaunched through it (fail-safe: refuse, don't escape). */
-const CMD_SHELL_UNSAFE_CHARS = /[&|<>^%"\r\n]/;
+/**
+ * The characters that genuinely cannot be made safe inside a `cmd.exe /c` command line, and so are
+ * still refused outright rather than escaped (fail-safe: refuse, don't guess). This is deliberately
+ * much narrower than the blanket `[&|<>^%"\r\n]` blocklist it replaces -- `& | < > ^` and `"` are
+ * now *correctly handled* by {@link quoteForWindowsCommandLine} instead of being rejected.
+ *
+ * Each remaining character was verified empirically on Windows 11 (26200) by round-tripping it
+ * through a real `%*`-forwarding `.cmd` shim, which is the exact shape of the npm launcher shims
+ * this fallback exists to reach:
+ *
+ *   * `%` -- cmd.exe performs `%VAR%` expansion *before* the quote/caret processing phase, so it
+ *     happens even inside a fully quoted token and cannot be suppressed by any quoting this
+ *     function can emit [observed: `pct-%PATH%-end` arrived as `pct-C:\Users\hp\bin;...-end`].
+ *     Rust's std works around this with a `%%cd:~,%` no-op-substring trick that depends on command
+ *     extensions being enabled; this file refuses instead, which is strictly safer and needs no
+ *     assumption about the inherited cmd.exe configuration.
+ *   * `\r` / `\n` -- terminate or truncate the command line [observed: `lf-\n-end` arrived as
+ *     `lf-`, `cr-\r-end` arrived as `cr--end`], so a trailing fragment could become a *second*
+ *     command. This matches the same refusal in Rust std's own `make_bat_command_line`.
+ *   * `\0` -- cannot appear in a Win32 command line at all.
+ *
+ * Note that `!` is *not* in this set: delayed expansion (`!VAR!`) is what would make it dangerous,
+ * and the relaunch passes `/v:OFF` explicitly to guarantee it is disabled regardless of the
+ * machine's `HKCU\Software\Microsoft\Command Processor\DelayedExpansion` registry setting
+ * [verified: `bang-!PATH!-end` round-trips verbatim].
+ */
+const CMD_IRREDUCIBLY_UNSAFE_CHARS = /[%\r\n\0]/;
 
-function canRelaunchViaWindowsCmd(args: readonly string[]): boolean {
-  return process.platform === "win32" && args.every((a) => !CMD_SHELL_UNSAFE_CHARS.test(a));
+/**
+ * Quotes one token for a Windows command line that will be parsed **twice**: first by cmd.exe's own
+ * `/c` line grammar, and then by the ultimately-spawned program's `CommandLineToArgvW`/MSVCRT argv
+ * parser (with, in the `.cmd`-shim case this fallback exists for, cmd.exe's `%*` raw-tail
+ * forwarding in between -- so the same string is re-parsed by cmd a second time).
+ *
+ * The rule -- taken from Rust std's `append_bat_arg`, the implementation hardened in response to
+ * CVE-2024-24576, and cross-checked against Node's `child_process` docs on `windowsVerbatimArguments`:
+ *
+ *   1. Wrap the whole token in `"` unconditionally. Everything inside a cmd.exe quoted region is
+ *      inert, which is what neutralises `& | < > ^ ( )` without needing caret escapes at all.
+ *   2. Escape an embedded `"` by **doubling** it (`""`), not as `\"`. Both parsers accept `""` as a
+ *      literal quote, and -- critically -- doubling keeps cmd.exe's raw `"` count even, so the
+ *      token never falls out of quoted context. `\"` is understood by the argv parser but *not* by
+ *      cmd.exe, and using it here is the actual root cause of the bug this replaces.
+ *   3. Double any run of backslashes that immediately precedes a `"` (embedded or the closing one),
+ *      per the documented `CommandLineToArgvW` rule that `2n` backslashes before a quote mean `n`
+ *      literal backslashes. Backslashes elsewhere are literal and are left alone, so ordinary
+ *      Windows paths (`C:\Users\hp\multi-loopr`) pass through untouched.
+ *
+ * Verified by round-tripping every case in `exec.test.ts` through both a real `%*`-forwarding
+ * `.cmd` shim and a directly-spawned `.exe`, in both cases recovering the argv byte-for-byte.
+ */
+export function quoteForWindowsCommandLine(arg: string): string {
+  let out = '"';
+  let backslashes = 0;
+  for (const ch of arg) {
+    if (ch === "\\") {
+      backslashes += 1;
+    } else {
+      if (ch === '"') {
+        // 2n backslashes before the literal quote we are about to double.
+        out += "\\".repeat(backslashes);
+        out += '"';
+      }
+      backslashes = 0;
+    }
+    out += ch;
+  }
+  // 2n backslashes before the closing quote, so a trailing `\` cannot escape it.
+  return `${out}${"\\".repeat(backslashes)}"`;
+}
+
+/**
+ * Builds the `cmd.exe` argv for the ENOENT relaunch, or returns `null` if no safe command line can
+ * be constructed -- in which case the caller must *not* relaunch and surfaces the original spawn
+ * error instead.
+ *
+ * The returned array is meant to be spawned with `windowsVerbatimArguments: true`: the final
+ * element is a single pre-escaped string, and letting libuv re-quote it would reintroduce exactly
+ * the `\"` dialect mismatch this function exists to avoid.
+ *
+ * `/d` skips AutoRun commands, `/v:OFF` disables delayed (`!VAR!`) expansion, and `/s` makes cmd
+ * strip only the outermost quote pair and treat the remainder verbatim -- which is why the whole
+ * line is wrapped in one extra pair of quotes here, leaving every individual token still quoted.
+ */
+export function buildWindowsCmdRelaunch(command: string, args: readonly string[]): readonly string[] | null {
+  // Windows file names can contain neither `"` nor a trailing `\` (the latter would escape the
+  // closing quote of the command token), so refusing them costs nothing real and keeps the command
+  // token unambiguous. Same guard as Rust std's `make_bat_command_line`.
+  if (command.includes('"') || command.endsWith("\\") || CMD_IRREDUCIBLY_UNSAFE_CHARS.test(command)) {
+    return null;
+  }
+  if (args.some((a) => CMD_IRREDUCIBLY_UNSAFE_CHARS.test(a))) {
+    return null;
+  }
+  const line = [command, ...args].map(quoteForWindowsCommandLine).join(" ");
+  return ["/d", "/s", "/v:OFF", "/c", `"${line}"`];
 }
 
 function isEnoent(err: Error): boolean {
@@ -111,6 +221,7 @@ function spawnOnce(
   command: string,
   args: readonly string[],
   allowWindowsCmdFallback: boolean,
+  windowsVerbatimArguments = false,
 ): Promise<RawInvocationResult> {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -123,6 +234,7 @@ function spawnOnce(
         env: o.env,
         shell: false,
         windowsHide: true,
+        windowsVerbatimArguments,
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
@@ -189,13 +301,19 @@ function spawnOnce(
 
     child.on("error", (err) => {
       // Asynchronous spawn failures (e.g. ENOENT) surface here rather than as a thrown exception.
-      if (allowWindowsCmdFallback && isEnoent(err) && canRelaunchViaWindowsCmd(args)) {
+      const relaunchArgs =
+        allowWindowsCmdFallback && process.platform === "win32" && isEnoent(err)
+          ? buildWindowsCmdRelaunch(command, args)
+          : null;
+      if (relaunchArgs !== null) {
         settled = true;
         clearTimeout(killTimer);
         if (sigkillTimer !== null) {
           clearTimeout(sigkillTimer);
         }
-        resolve(spawnOnce(o, "cmd.exe", ["/d", "/s", "/c", command, ...args], false));
+        // `windowsVerbatimArguments: true` -- `relaunchArgs`'s last element is already a fully
+        // escaped cmd.exe line; letting libuv re-quote it would corrupt it (see the file header).
+        resolve(spawnOnce(o, "cmd.exe", relaunchArgs, false, true));
         return;
       }
       settle(null, null, err.message);
