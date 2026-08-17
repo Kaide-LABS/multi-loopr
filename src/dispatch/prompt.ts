@@ -76,15 +76,31 @@ export interface ProtocolInstructionParams {
 /**
  * Renders the protocol instructions every dispatched turn receives: the exact `HandoffRecord`
  * shape to produce (name *and* value shape per field -- see
- * {@link handoffRecordFieldSpecLines}), where to write it, the isolation rule, the advisory-only
- * nature of agent-authored `repo`/`spec_ref`, the honest-halt requirement, and (Phase 4, new) the
- * instruction to genuinely read and record loopr's own `baby_prd.md`/`context.md` for this build.
- * Prose is not fixed verbatim by the spec -- what is load-bearing is that each of the eight
- * mandatory-content items appears as a literal substring (PHASE_3_SPEC.md §6.2 items 1-6,
- * PHASE_4_SPEC.md §6.2 items 7-8, all tested individually); item 2's eighteen field names now
- * appear as an annotated list rather than a bare comma-joined one, which satisfies the same
- * substring requirement while removing the value-shape ambiguity that broke a live dispatch.
- * Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
+ * {@link handoffRecordFieldSpecLines}), where to write it, the isolation rule, the requirement to
+ * really commit the turn's work, the advisory-only nature of agent-authored `repo`/`spec_ref`, the
+ * honest-halt requirement, and (Phase 4, new) the instruction to genuinely read and record loopr's
+ * own `baby_prd.md`/`context.md` for this build. Prose is not fixed verbatim by the spec -- what is
+ * load-bearing is that each of the eight mandatory-content items appears as a literal substring
+ * (PHASE_3_SPEC.md §6.2 items 1-6, PHASE_4_SPEC.md §6.2 items 7-8, all tested individually); item
+ * 2's eighteen field names now appear as an annotated list rather than a bare comma-joined one,
+ * which satisfies the same substring requirement while removing the value-shape ambiguity that
+ * broke a live dispatch. Shared verbatim by {@link buildExecutorPrompt} and
+ * {@link buildReviewerPrompt}, so the commit requirement below binds both roles from one place.
+ *
+ * [DECISION] The commit requirement is stated explicitly, and item 4's "advisory only" sentence is
+ * scoped explicitly to *field values*, because the pair was genuinely ambiguous in live dispatch: a
+ * real Claude Code executor turn did the phase's actual work (wrote the module, wrote its tests,
+ * ran them green) and reported `status: "completed"` without ever running `git add`/`git commit` --
+ * a plausible reading of "do not spend turn budget trying to get git plumbing exactly right" is
+ * "git is optional here". Ground-truth reconciliation (`src/dispatch/record.ts`) correctly saw
+ * `head_before === head_after`, `commits: []`, and refused the turn on R3 (`src/domain/relay.ts`).
+ * The advisory note is true of the *values* the agent self-reports for `repo`/`spec_ref`; it was
+ * never permission to skip the underlying action, so the two ideas are now separated and each
+ * bounded. The neutral-commit-message clause rides along deliberately: the turn is now told to
+ * commit, and an attribution trailer in that commit is a hard `BoundaryViolationError`
+ * (`src/verify/commits.ts`, PRD §7 I4) that fails the run with no retry -- strictly worse than the
+ * retryable R3 refusal it would replace -- so the requirement and its constraint are stated
+ * together. Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
  */
 export function buildProtocolInstructions(p: ProtocolInstructionParams): string {
   return [
@@ -105,10 +121,25 @@ export function buildProtocolInstructions(p: ProtocolInstructionParams): string 
     "These value shapes are validated mechanically and a mismatch refuses the whole turn, so " +
       "follow them literally rather than substituting a conventional-looking equivalent.",
     "",
+    "You must commit your work to git before your turn ends. Stage and commit every file you " +
+      "created or modified this turn (git add, then git commit), so that at least one new commit " +
+      "exists on the branch when you finish. This is a real action you have to perform, not " +
+      "bookkeeping: multi-loopr reads the branch's own git history itself, comparing HEAD before " +
+      "your turn against HEAD after it, and mechanically refuses the entire turn if you report " +
+      'status: "completed" with no new commit. Work left uncommitted in the working tree does not ' +
+      "count, however genuinely it was done.",
+    "",
+    "Keep the commit message neutral and factual -- describe the change itself, and add no " +
+      "AI-attribution or model-generation trailer of any kind (no co-authored-by line naming an AI " +
+      'assistant or model, no "generated with" tool credit, no emoji generation credit). A commit ' +
+      "carrying one of those fails the whole run outright as a boundary violation, with no retry.",
+    "",
     "The repo and spec_ref values you write are advisory only: multi-loopr independently " +
       "recomputes both from its own git and file-hash inspection after your turn ends, and " +
       "overwrites whatever you wrote there -- do not spend turn budget trying to get git plumbing " +
-      "exactly right.",
+      "exactly right. That is strictly about the accuracy of those two fields' values, and about " +
+      "nothing else: it does not make committing optional. Recording the wrong commit ids costs " +
+      "you nothing; not making the commit refuses the turn.",
     "",
     "work_done, next_steps, and open_questions must be strictly factual: a record of what was " +
       "done and what remains, never your reasoning, chain of thought, or a transcript excerpt, and " +
@@ -208,7 +239,10 @@ export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
  * (2) an explicit statement, branching on `isFinalPhase`, of what that content must be -- the real
  * next phase's technical blueprint on a non-final phase, this build's completion record on the
  * final phase -- and that the path must be recorded, with its real hash, in `artifacts_written`, or
- * multi-loopr will treat the phase as bypassed, not completed. Never called from
+ * multi-loopr will treat the phase as bypassed, not completed. A third line restates, at the point
+ * the reviewer is told to write this specific file, that it must land in the turn's real git commit
+ * -- {@link buildProtocolInstructions}'s shared commit requirement already binds the reviewer, and
+ * this is the one file a reviewer turn is most likely to leave untracked. Never called from
  * {@link buildExecutorPrompt}. Implements PHASE_4_SPEC.md §6.2.
  */
 export function buildArtifactProductionInstructions(expectedArtifactPath: string, isFinalPhase: boolean): string {
@@ -223,6 +257,9 @@ export function buildArtifactProductionInstructions(expectedArtifactPath: string
       `That content must be ${contentDescription}.`,
     `You must also record "${expectedArtifactPath}" with its real SHA-256 hash in ` +
       "artifacts_written -- otherwise multi-loopr will treat this phase as bypassed, not completed.",
+    `Commit "${expectedArtifactPath}", along with every other file you changed this turn, in this ` +
+      "turn's own git commit -- the commit requirement in the protocol instructions above covers " +
+      "this file too.",
   ].join("\n");
 }
 

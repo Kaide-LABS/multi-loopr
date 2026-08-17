@@ -144,6 +144,74 @@ test("buildProtocolInstructions annotates every HandoffRecord field with a value
   assert.ok(out.includes('For this turn it is "reviewer".'));
 });
 
+test("buildProtocolInstructions requires the turn to really perform a git commit, in terms that cannot be read as optional", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",
+    role: "executor",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+
+  // Regression: a live dispatched turn did the phase's real work and reported status "completed"
+  // without ever running git add/git commit -- a plausible reading of the advisory-fields note as
+  // "git is optional". Ground-truth reconciliation refused it on R3. The prompt must state the
+  // action as mandatory, in its own right, and name R3's consequence in plain language.
+  const commitMandate = out.split("\n").filter((line) => /\bmust\b/.test(line) && /\bcommit\b/.test(line));
+  assert.ok(commitMandate.length >= 1, "expected at least one line stating the commit as a must");
+  assert.ok(out.includes("You must commit your work to git before your turn ends."));
+  assert.ok(out.includes("git add"));
+  assert.ok(out.includes("git commit"));
+  assert.ok(out.includes("at least one new commit"));
+  // R3's actual consequence, stated as a mechanical refusal rather than a schema detail.
+  assert.ok(out.includes("mechanically refuses the entire turn"));
+  assert.ok(out.includes('status: "completed" with no new commit'));
+  // Uncommitted work is explicitly disqualified -- the exact state the live turn ended in.
+  assert.ok(out.includes("Work left uncommitted in the working tree does not count"));
+});
+
+test("buildProtocolInstructions keeps the commit requirement separate from, and bounds, the advisory-fields note", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/handoff.json",
+    role: "executor",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+  const lines = out.split("\n");
+
+  const advisoryIndex = lines.findIndex((line) => line.includes("advisory only"));
+  const mandateIndex = lines.findIndex((line) => line.includes("You must commit your work to git"));
+  assert.ok(advisoryIndex >= 0);
+  assert.ok(mandateIndex >= 0);
+  // Two distinct statements, not one blended sentence, and the mandate is stated first so the
+  // advisory note reads as a bounded exception to it rather than as a licence.
+  assert.notEqual(advisoryIndex, mandateIndex);
+  assert.ok(mandateIndex < advisoryIndex);
+
+  // The advisory statement bounds itself in place: it is about those two fields' values only.
+  const advisoryLine = lines[advisoryIndex] ?? "";
+  assert.ok(advisoryLine.includes("does not make committing optional"));
+  assert.ok(advisoryLine.includes("accuracy of those two fields' values"));
+});
+
+test("buildProtocolInstructions pairs the commit requirement with the neutral-commit-message constraint (I4)", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/handoff.json",
+    role: "reviewer",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+
+  // Now that every turn is told to commit, an attribution trailer in that commit would be a hard
+  // BoundaryViolationError with no retry -- strictly worse than the retryable R3 refusal it
+  // replaces. The prompt states the constraint alongside the requirement.
+  assert.ok(out.includes("Keep the commit message neutral and factual"));
+  assert.ok(out.includes("AI-attribution or model-generation trailer"));
+  assert.ok(out.includes("fails the whole run outright as a boundary violation"));
+});
+
 test("buildHandoffContext renders only the allow-listed fields, never a raw JSON dump", () => {
   const out = buildHandoffContext(priorRecord());
   assert.ok(out.includes("Implemented foo."));
@@ -161,6 +229,40 @@ test("buildHandoffContext renders only the allow-listed fields, never a raw JSON
 
 const BABY_PRD_REPO_REL_PATH = ".claude/loopr/baby_prd.md";
 const CONTEXT_REPO_REL_PATH = ".claude/loopr/context.md";
+
+test("both dispatched roles receive the commit requirement -- buildProtocolInstructions is shared, so one statement binds executor and reviewer alike", () => {
+  const executorOut = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: null,
+    retryNote: null,
+  });
+  const reviewerOut = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
+    retryNote: null,
+  });
+
+  for (const out of [executorOut, reviewerOut]) {
+    assert.ok(out.includes("You must commit your work to git before your turn ends."));
+    assert.ok(out.includes("mechanically refuses the entire turn"));
+    assert.ok(out.includes("Keep the commit message neutral and factual"));
+  }
+
+  // And the reviewer is told, at the point it is handed its own artifact path, that the artifact
+  // itself belongs in that commit -- the one file a reviewer turn is most likely to leave untracked.
+  assert.ok(reviewerOut.includes('Commit "PHASE_2_SPEC.md", along with every other file you changed this turn'));
+  assert.ok(buildArtifactProductionInstructions("PHASE_5_SPEC.md", false).includes('Commit "PHASE_5_SPEC.md"'));
+});
 
 test("buildExecutorPrompt omits handoff context on the first turn (priorRecord: null) and includes it on the second", () => {
   const first = buildExecutorPrompt({
