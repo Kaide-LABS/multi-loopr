@@ -1,25 +1,26 @@
 {
   "name": "multi-loopr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local, headless harness that runs loopr's spec discipline across Claude Code and Codex CLI.",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "multi-loopr": "src/cli/main.ts"
+    "multi-loopr": "dist/cli/main.js"
   },
   "engines": {
     "node": ">=24.0.0"
   },
   "files": [
-    "src",
-    "!src/**/*.test.ts",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"src/**/*.test.ts\"",
-    "check": "npm run typecheck && npm run test && node src/cli/main.ts doctor --boundary"
+    "check": "npm run typecheck && npm run test && node src/cli/main.ts doctor --boundary",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "zod": "4.4.3"
