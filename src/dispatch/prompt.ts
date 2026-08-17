@@ -202,6 +202,29 @@ export function buildProtocolInstructions(p: ProtocolInstructionParams): string 
  * `RawInvocationResult`, so there is no raw process output available to leak even by mistake.
  * Applies PRD §7 I5's isolation rule uniformly to both the second executor turn's context and the
  * reviewer's context. Implements PHASE_3_SPEC.md §6.2.
+ *
+ * [DECISION] The `artifacts_written` list is followed by an explicit instruction to read each of
+ * those files back and record every one of them in the receiving turn's own `artifacts_read`,
+ * because its absence was load-bearing in live dispatch: a real cross-provider handoff (Claude Code
+ * turn 0 wrote `wordcount.mjs` and `wordcount.test.mjs`; Codex CLI turn 1 demonstrably read and
+ * extended both -- its `work_done` describes adding a regression test to the existing suite) was
+ * refused as `IGNORED (failed: C5_ARTIFACT_ATTESTATION)`, twice, because the receiving turn's
+ * `artifacts_read` listed only the three loopr artifacts whose own instructions ask for the
+ * recording. The list above is rendered as informational context, and informational context implies
+ * no bookkeeping obligation -- exactly the gap the phase-spec sentence had in
+ * {@link buildProtocolInstructions}. `checkC5ArtifactAttestation()` (`src/verify/continuity.ts`,
+ * PRD §2 AC1/AC3) is the mechanical proof that the second agent picked up the first agent's real
+ * work, so the prompt now asks for precisely what that check reads.
+ *
+ * Placed here rather than in {@link buildProtocolInstructions} for two reasons. It fires exactly
+ * when it applies: {@link buildExecutorPrompt} calls this function only for `priorRecord !== null`,
+ * so a fresh first turn -- which has no prior artifacts and is never a C5 subject -- never sees it,
+ * while every turn that *is* a C5 subject does. And it sits directly beneath the concrete paths it
+ * refers to, so "each of the files listed above" resolves without the turn having to correlate two
+ * distant sections. {@link buildReviewerPrompt} calls this same function unconditionally, and
+ * `runTurn()`'s loop runs `verifyContinuation()` over *every* consecutive pair including
+ * executor->reviewer (`src/dispatch/run-loop.ts`), so the reviewer is bound by C5 identically and is
+ * covered by this one placement -- no separate reviewer-side statement is needed.
  */
 export function buildHandoffContext(prev: HandoffRecord): string {
   const lines: string[] = [];
@@ -220,6 +243,24 @@ export function buildHandoffContext(prev: HandoffRecord): string {
   lines.push("artifacts_written:");
   for (const artifact of prev.artifacts_written) {
     lines.push(`  - ${artifact.path} (sha256 ${artifact.sha256})`);
+  }
+  if (prev.artifacts_written.length > 0) {
+    lines.push("");
+    lines.push(
+      "You must genuinely open and read every file listed under artifacts_written above before you " +
+        "do your own work -- that is the prior turn's actual output, and this turn's job is to " +
+        "continue it, not to restart it.",
+    );
+    lines.push(
+      "You must then record every one of those paths, with its SHA-256, in your own record's " +
+        "artifacts_read array -- each one, not a representative sample, and in addition to the " +
+        "loopr artifacts you were already told to record there. This is checked mechanically and it " +
+        "is the single check that proves you continued the prior agent's real work: multi-loopr " +
+        "verifies that every artifact the prior turn wrote was genuinely read back by this turn, by " +
+        "path and by matching hash, and refuses the entire turn if even one of them is missing from " +
+        "artifacts_read. Having read a file, and having said so in work_done, does not count -- the " +
+        "path has to be in artifacts_read.",
+    );
   }
   return lines.join("\n");
 }

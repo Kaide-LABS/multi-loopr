@@ -259,6 +259,102 @@ test("buildHandoffContext renders only the allow-listed fields, never a raw JSON
 const BABY_PRD_REPO_REL_PATH = ".claude/loopr/baby_prd.md";
 const CONTEXT_REPO_REL_PATH = ".claude/loopr/context.md";
 
+test("buildHandoffContext tells the receiving turn to read the prior turn's artifacts back and record them in artifacts_read", () => {
+  // Regression: a live cross-provider handoff (Claude Code turn 0 wrote wordcount.mjs and
+  // wordcount.test.mjs; Codex CLI turn 1 demonstrably read and extended both) was refused as
+  // IGNORED (failed: C5_ARTIFACT_ATTESTATION), twice, because the receiving turn's artifacts_read
+  // listed only the three loopr artifacts. artifacts_written was rendered as informational context
+  // and nothing ever stated the required action. checkC5ArtifactAttestation() (PRD §2 AC1/AC3) is
+  // the mechanical proof of genuine continuation, so the prompt must ask for exactly what it reads.
+  const out = buildHandoffContext(
+    priorRecord({
+      artifacts_written: [
+        { path: "wordcount.mjs", sha256: "e".repeat(64) },
+        { path: "wordcount.test.mjs", sha256: "f".repeat(64) },
+      ],
+    }),
+  );
+
+  // The paths themselves are still rendered, as they always were.
+  assert.ok(out.includes("  - wordcount.mjs (sha256 " + "e".repeat(64) + ")"));
+  assert.ok(out.includes("  - wordcount.test.mjs (sha256 " + "f".repeat(64) + ")"));
+
+  // ...and now the action they imply is stated outright, as a must, naming artifacts_read.
+  const mandate = out
+    .split("\n")
+    .filter((line) => /\bmust\b/.test(line) && line.includes("artifacts_read"));
+  assert.ok(mandate.length >= 1, "expected at least one line stating the artifacts_read recording as a must");
+  assert.ok(out.includes("You must genuinely open and read every file listed under artifacts_written above"));
+  assert.ok(out.includes("record every one of those paths, with its SHA-256, in your own record's artifacts_read array"));
+  // C5's actual consequence, in plain language rather than as a check id.
+  assert.ok(out.includes("every artifact the prior turn wrote was genuinely read back by this turn"));
+  assert.ok(out.includes("refuses the entire turn"));
+  // The exact failure mode observed live: read the file, said so in work_done, never listed it.
+  assert.ok(out.includes("the path has to be in artifacts_read"));
+
+  // The instruction appears after the list it refers to, so "listed above" actually resolves.
+  const lines = out.split("\n");
+  const lastArtifactIndex = lines.findIndex((line) => line.includes("wordcount.test.mjs (sha256"));
+  const instructionIndex = lines.findIndex((line) => line.includes("You must genuinely open and read every file"));
+  assert.ok(lastArtifactIndex >= 0);
+  assert.ok(instructionIndex > lastArtifactIndex);
+});
+
+test("the read-back instruction is omitted when the prior turn wrote nothing, and absent entirely from a first turn", () => {
+  // Nothing to read back: the instruction would be pure noise, and C5 is vacuously satisfied.
+  const empty = buildHandoffContext(priorRecord({ artifacts_written: [] }));
+  assert.ok(!empty.includes("artifacts_read"));
+  assert.ok(!empty.includes("You must genuinely open and read every file"));
+
+  // A first executor turn (priorRecord: null) never gets buildHandoffContext at all, so it never
+  // sees a read-back instruction for artifacts that do not exist.
+  const first = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: null,
+    retryNote: null,
+  });
+  assert.ok(!first.includes("You must genuinely open and read every file listed under artifacts_written above"));
+  assert.ok(!first.includes("every artifact the prior turn wrote was genuinely read back by this turn"));
+});
+
+test("both C5-subject turns receive the read-back instruction -- the second executor turn and the reviewer alike", () => {
+  // verifyContinuation() runs over every consecutive pair, executor->reviewer included
+  // (src/dispatch/run-loop.ts), so the reviewer is bound by C5 identically. buildHandoffContext is
+  // shared by both prompt builders, so one placement covers both paths.
+  const second = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    retryNote: null,
+  });
+  const reviewer = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
+    retryNote: null,
+  });
+
+  for (const out of [second, reviewer]) {
+    assert.ok(out.includes("You must genuinely open and read every file listed under artifacts_written above"));
+    assert.ok(out.includes("record every one of those paths, with its SHA-256, in your own record's artifacts_read array"));
+    assert.ok(out.includes("refuses the entire turn"));
+    // And the prior turn's real artifact path is right there above it.
+    assert.ok(out.includes("src/foo.ts"));
+  }
+});
+
 test("both dispatched roles receive the commit requirement -- buildProtocolInstructions is shared, so one statement binds executor and reviewer alike", () => {
   const executorOut = buildExecutorPrompt({
     role: "executor",
