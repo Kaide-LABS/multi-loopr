@@ -14,7 +14,9 @@ import type { Invocation, PreflightReport, ProviderAdapter } from "../ports/prov
 import { runProcess } from "../util/exec.ts";
 import { sha256File } from "../util/hash.ts";
 import { handoffPath } from "../util/paths.ts";
-import { runTurn } from "./turn.ts";
+import { ATTRIBUTION_PATTERNS, checkCommitNeutrality } from "../verify/commits.ts";
+import { changedPaths, commitMessages } from "../verify/git.ts";
+import { buildFallbackCommitMessage, runTurn } from "./turn.ts";
 
 const GIT_TIMEOUT_MS = 30_000;
 
@@ -469,6 +471,185 @@ test("runTurn: when either new guard throws, writeHandoffRecord is never called 
     const onDisk = await readFile(path, "utf8");
     const parsed = JSON.parse(onDisk) as { readonly spec_ref: { readonly path: string } };
     assert.equal(parsed.spec_ref.path, "WRONG.md");
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Step 5.5 -- multi-loopr's own fallback commit for a turn whose agent could not commit itself.
+// Empirically motivated: codex-cli under `--sandbox workspace-write` on Windows cannot write to
+// `.git/` at all (`fatal: Unable to create '<repo>/.git/index.lock': Permission denied`), so the
+// fixture below models exactly that -- a turn that writes real files and never commits.
+// -------------------------------------------------------------------------------------------
+
+test("runTurn: a turn that leaves uncommitted changes gets them committed by multi-loopr, and reconciles to commits.length >= 1", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      // The sandboxed-agent shape: real work lands on disk across all three change kinds, and not
+      // a single `git` write happens -- no add, no commit.
+      await writeFile(`${dir}/foo.txt`, "v1 modified by the agent\n", "utf8"); // tracked, unstaged
+      await writeFile(`${dir}/brand-new.txt`, "created by the agent\n", "utf8"); // untracked
+      await writeHandoffRecord(
+        path,
+        draftFor(
+          req,
+          // The agent honestly reports no commits, because it genuinely made none.
+          { branch: "main", head_before: commit0, head_after: commit0, commits: [] },
+          { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+        ),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+
+    assert.equal(result.outcome.ok, true);
+    assert.ok(result.record !== null);
+    // R3 is now genuinely satisfiable: reconciliation, which reads HEAD itself at call time, sees
+    // the fallback commit because step 5.5 ran before it.
+    assert.equal(result.record?.repo.commits.length, 1);
+    assert.equal(result.record?.repo.head_before, commit0);
+    assert.notEqual(result.record?.repo.head_after, commit0);
+    assert.equal(result.record?.status, "completed");
+
+    // Both kinds of leftover really made it into that one commit.
+    const touched = [...(await changedPaths(dir, commit0, result.record?.repo.head_after ?? ""))].sort();
+    assert.deepStrictEqual(touched, ["baby_prd.md", "brand-new.txt", "context.md", "foo.txt", "PHASE_1_SPEC.md"].sort());
+
+    // And the tree it left behind is clean apart from multi-loopr's own bookkeeping.
+    assert.equal((await git(dir, ["status", "--short", "--", ":(top)", ":(exclude,top).multi-loopr"])).trim(), "");
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: the fallback commit's message is neutral and carries the turn's identifying metadata", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
+    const req = baseReq({ repoDir: dir, provider: "codex-cli", archetype: "reviewer", phase: 3, turnIndex: 2 });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await writeFile(`${dir}/work.txt`, "uncommitted work\n", "utf8");
+      await writeHandoffRecord(
+        path,
+        draftFor(
+          req,
+          { branch: "main", head_before: commit0, head_after: commit0, commits: [] },
+          { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+        ),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+    const oids = [...(result.record?.repo.commits ?? [])];
+    assert.equal(oids.length, 1);
+
+    // Neutral by the very check step 8 applies (assertNeutralCommits already ran without throwing
+    // inside runTurn; this asserts the underlying verdict explicitly rather than by absence).
+    const neutrality = await checkCommitNeutrality(dir, oids);
+    assert.equal(neutrality.clean, true, JSON.stringify(neutrality.offenders));
+
+    const [message] = await commitMessages(dir, oids);
+    assert.ok(message !== undefined);
+    assert.match(message, /^chore: capture a dispatched turn's uncommitted working-tree changes \(multi-loopr\)/);
+    assert.ok(message.includes(`run-id: ${req.runId}`));
+    assert.ok(message.includes("phase: 3"));
+    assert.ok(message.includes("turn-index: 2"));
+    assert.ok(message.includes("provider: codex-cli"));
+    assert.ok(message.includes("archetype: reviewer"));
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("buildFallbackCommitMessage is neutral by construction, for every provider/archetype combination", () => {
+  // The message never passes through a model, so its neutrality is a property of the source. This
+  // asserts that directly against the same ATTRIBUTION_PATTERNS assertNeutralCommits enforces,
+  // rather than relying on one sampled commit in the integration tests above.
+  for (const provider of ["claude-code", "codex-cli"] as const) {
+    for (const archetype of ["executor", "reviewer"] as const) {
+      const message = buildFallbackCommitMessage(baseReq({ provider, archetype }));
+      for (const pattern of ATTRIBUTION_PATTERNS) {
+        assert.equal(pattern.test(message), false, `${provider}/${archetype} matched ${pattern.source}`);
+      }
+    }
+  }
+});
+
+test("runTurn: a turn that genuinely changes nothing still reconciles to commits.length === 0 -- the fallback does not manufacture a commit", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    // Loopr's three artifacts are committed here (not merely written), so that writing the handoff
+    // record is the *only* thing that touches the tree during the turn -- and that lives under
+    // .multi-loopr/, which step 5.5 excludes. A genuinely idle turn must stay at zero commits.
+    await writeLooprArtifacts(dir);
+    await git(dir, ["add", "-A"]);
+    await git(dir, ["commit", "--quiet", "-m", "loopr artifacts"]);
+    const base = (await git(dir, ["rev-parse", "HEAD"])).trim();
+    assert.notEqual(base, commit0);
+
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await writeHandoffRecord(
+        path,
+        draftFor(req, { branch: "main", head_before: base, head_after: base, commits: [] }),
+      );
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    // Zero commits + status "completed" is still an R3 violation, and must still be refused --
+    // proof no commit was fabricated to paper over an idle turn.
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+    assert.equal(result.outcome.ok, false);
+    assert.ok(result.outcome.failure instanceof RelaySchemaError);
+    assert.equal((await git(dir, ["rev-parse", "HEAD"])).trim(), base);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("runTurn: the fallback runs unconditionally -- a turn reporting status blocked still has its working-tree work captured", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
+    const artifacts = await writeLooprArtifacts(dir);
+    const req = baseReq({ repoDir: dir });
+    const path = handoffPath(dir, req.runId, req.phase, req.turnIndex, req.archetype, req.provider);
+
+    const fakeRunProcess: typeof runProcess = async () => {
+      await writeFile(`${dir}/partial.txt`, "half-finished but real\n", "utf8");
+      const draft = draftFor(
+        req,
+        { branch: "main", head_before: commit0, head_after: commit0, commits: [] },
+        { artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec] },
+      );
+      // status "blocked": R3 does not apply, so nothing forces a commit -- yet the work must not
+      // be silently dropped either. Step 5.5 runs before the record is even read, so the record's
+      // own claimed status cannot influence whether the capture happens.
+      await writeHandoffRecord(path, { ...draft, status: "blocked" });
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runTurn(req, { adapter: new FakeAdapter(), runProcessFn: fakeRunProcess });
+
+    assert.equal(result.outcome.ok, true);
+    assert.equal(result.record?.status, "blocked");
+    assert.equal(result.record?.repo.commits.length, 1);
+    assert.ok((await changedPaths(dir, commit0, result.record?.repo.head_after ?? "")).includes("partial.txt"));
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

@@ -40,9 +40,17 @@ export function isSafeRepoRelPath(p: string): boolean {
   return true;
 }
 
+/**
+ * The repo-root-relative name of the directory multi-loopr owns within a repo. Exported as its own
+ * constant (rather than only being embedded in {@link multiLooprDir}) because callers that need it
+ * as a *git pathspec* -- e.g. excluding multi-loopr's own bookkeeping from a working-tree scan --
+ * need the relative name, not the absolute path {@link multiLooprDir} returns.
+ */
+export const MULTI_LOOPR_DIR_NAME = ".multi-loopr";
+
 /** The `.multi-loopr/` directory multi-loopr owns within a repo. */
 export function multiLooprDir(repoDir: string): string {
-  return `${repoDir}/.multi-loopr`;
+  return `${repoDir}/${MULTI_LOOPR_DIR_NAME}`;
 }
 
 /** The exclusive run-lock file path (`src/util/lock.ts`, PRD §9 FM6). */

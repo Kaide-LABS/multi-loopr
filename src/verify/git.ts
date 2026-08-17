@@ -137,6 +137,179 @@ export async function diffText(repoDir: string, fromOid: string, toOid: string):
 }
 
 /**
+ * Builds the pathspec list every working-tree primitive below passes after `--`: one positive
+ * `:(top)` (the whole repository, resolved from its root rather than from the process cwd) followed
+ * by one `:(exclude,top)` entry per caller-supplied path.
+ *
+ * `:(top)` is mandatory as the positive element. An `:(exclude)` pathspec only ever *subtracts*
+ * from the set some positive pathspec already selected, so an exclude-only list matches nothing at
+ * all. [Verified empirically on git 2.x/Windows: with `:/` used as the positive element and
+ * `:(exclude):/.multi-loopr` as the exclusion, `git ls-files --others` still listed
+ * `.multi-loopr/runs/x/rec.json` -- `:/` is only valid as *shorthand* magic for a whole pathspec,
+ * not as a prefix inside another pathspec's `:(...)` magic, so that form silently excludes nothing.
+ * `:(top)` on both sides excludes correctly.]
+ */
+function treePathspecs(excludeDirs: readonly string[]): readonly string[] {
+  return [":(top)", ...excludeDirs.map((d) => `:(exclude,top)${d}`)];
+}
+
+/**
+ * `git diff --quiet [--cached] -- <pathspecs>`. Exit `0` -> `false` (no difference); exit `1` ->
+ * `true` (a difference exists); anything else -> {@link InternalError}. `--quiet` is a *plumbing-safe*
+ * predicate: it produces no output to parse at all and communicates purely through its exit code,
+ * which is exactly why this module uses it rather than `git status --porcelain` (see the file
+ * header -- porcelain output is documented by git as subject to change; a `--quiet` exit code is not).
+ */
+async function diffHasChanges(repoDir: string, cached: boolean, excludeDirs: readonly string[]): Promise<boolean> {
+  const args = cached
+    ? ["diff", "--cached", "--quiet", "--", ...treePathspecs(excludeDirs)]
+    : ["diff", "--quiet", "--", ...treePathspecs(excludeDirs)];
+  const result = await git(repoDir, args);
+  if (result.exitCode === 0) {
+    return false;
+  }
+  if (result.exitCode === 1) {
+    return true;
+  }
+  throw new InternalError(`git ${args.join(" ")} returned exit ${String(result.exitCode)} in ${repoDir}: ${result.stderr.trim()}`, {
+    repoDir,
+    args,
+    exitCode: result.exitCode,
+    stderr: result.stderr,
+  });
+}
+
+/** What {@link workingTreeChanges} found, broken out by the three independent kinds of change. */
+export interface WorkingTreeChanges {
+  /** A tracked file differs between the working tree and the index (`git diff --quiet`). */
+  readonly trackedModified: boolean;
+  /** The index differs from `HEAD` -- work the agent staged but never committed (`git diff --cached --quiet`). */
+  readonly staged: boolean;
+  /** Repo-relative POSIX paths of new, non-ignored files git does not track yet. */
+  readonly untracked: readonly string[];
+  /** `true` iff any of the three above is non-empty -- the single predicate callers act on. */
+  readonly hasAny: boolean;
+}
+
+/**
+ * [DET] Whether `repoDir`'s working tree carries anything not yet in `HEAD`, checked across all
+ * three independent kinds of change -- unstaged edits to tracked files, a staged-but-uncommitted
+ * index, and brand-new untracked files. All three are required: an agent's newly created file is
+ * untracked until something runs `git add`, so a tracked-only check would report a genuinely
+ * productive turn as having changed nothing.
+ *
+ * Every probe is plumbing or an exit-code-only predicate, never `git status --porcelain`:
+ * `git diff --quiet` and `git diff --cached --quiet` communicate solely through exit status (`0` =
+ * no difference, `1` = difference), and `git ls-files --others --exclude-standard -z` is plumbing
+ * whose `-z` NUL-separated output is an explicitly stable format. `--exclude-standard` is what makes
+ * the untracked probe honour `.gitignore`/`.git/info/exclude`, so a repo's own ignored build output
+ * never counts as "the agent left work behind".
+ *
+ * `excludeDirs` holds repo-root-relative directories to leave out of all three probes.
+ */
+export async function workingTreeChanges(
+  repoDir: string,
+  excludeDirs: readonly string[] = [],
+): Promise<WorkingTreeChanges> {
+  const [trackedModified, staged] = await Promise.all([
+    diffHasChanges(repoDir, false, excludeDirs),
+    diffHasChanges(repoDir, true, excludeDirs),
+  ]);
+
+  const listed = await git(repoDir, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...treePathspecs(excludeDirs)]);
+  if (listed.exitCode !== 0) {
+    throw new InternalError(`git ls-files --others --exclude-standard -z failed in ${repoDir}: ${listed.stderr.trim()}`, {
+      repoDir,
+      exitCode: listed.exitCode,
+      stderr: listed.stderr,
+    });
+  }
+  const parts = listed.stdout.split("\0");
+  if (parts.length > 0 && parts[parts.length - 1] === "") {
+    parts.pop();
+  }
+
+  return {
+    trackedModified,
+    staged,
+    untracked: parts,
+    hasAny: trackedModified || staged || parts.length > 0,
+  };
+}
+
+/**
+ * [DET] `git add -A` (optionally undoing `excludeDirs` again with `git reset`) followed by
+ * `git commit -m <message>`, returning the new commit's full object id. `-A` is what makes this
+ * total over all three change kinds {@link workingTreeChanges} detects -- modifications, additions
+ * *and* deletions -- so the resulting commit is exactly "the working tree as the turn left it".
+ *
+ * The exclusion is applied as a second `git reset -- <dir>` pass rather than as an `:(exclude)`
+ * pathspec on the `git add` itself, and that is a bug fix, not a stylistic choice.
+ * `git add -A -- ':(top)' ':(exclude,top).multi-loopr'` **exits 1** whenever the excluded directory
+ * also happens to be listed in the repo's own `.gitignore`: naming a path in *any* pathspec, even a
+ * negative one, trips `git add`'s "the following paths are ignored by one of your .gitignore files"
+ * check. [Observed directly against a real repo: staging was still entirely correct in every case
+ * -- the excluded directory was never added -- but the non-zero exit made this wrapper throw, which
+ * killed a real end-to-end run whose target repo sensibly gitignored `.multi-loopr/`. Neither
+ * `-c advice.addIgnoredFile=false` nor `--ignore-errors` changes the exit code; both only suppress
+ * the text.]
+ *
+ * `git reset -q -- <dir>` has exactly the right semantics for undoing the over-broad `add` in both
+ * possible states, and was verified against both: when the directory is absent from `HEAD` its
+ * entries are dropped from the index entirely (back to untracked), and when it *is* tracked in
+ * `HEAD` its entries are restored to their `HEAD` state (so no spurious deletion is staged). It is
+ * skipped altogether when `excludeDirs` is empty, since a bare `git reset --` with no pathspec
+ * would reset the whole index.
+ *
+ * `message` is passed as a single `-m` argv element, never through a shell and never through a
+ * file: `runProcess` spawns with `shell: false`, so no character in the message is interpretable.
+ * Callers are responsible for the message's *content* being neutral (PRD §7 I4); this wrapper
+ * neither composes nor inspects it.
+ *
+ * Throws {@link InternalError} if any step fails -- including the "nothing to commit" case, which
+ * `git commit` reports as exit `1`. Callers must therefore establish that there is something to
+ * commit (via {@link workingTreeChanges}) before calling this.
+ */
+export async function stageAllAndCommit(
+  repoDir: string,
+  message: string,
+  excludeDirs: readonly string[] = [],
+): Promise<string> {
+  const added = await git(repoDir, ["add", "-A", "--", ":(top)"]);
+  if (added.exitCode !== 0) {
+    throw new InternalError(`git add -A failed in ${repoDir}: ${added.stderr.trim()}`, {
+      repoDir,
+      exitCode: added.exitCode,
+      stderr: added.stderr,
+    });
+  }
+
+  if (excludeDirs.length > 0) {
+    const reset = await git(repoDir, ["reset", "--quiet", "--", ...excludeDirs.map((d) => `:(top)${d}`)]);
+    if (reset.exitCode !== 0) {
+      throw new InternalError(`git reset of excluded paths failed in ${repoDir}: ${reset.stderr.trim()}`, {
+        repoDir,
+        excludeDirs,
+        exitCode: reset.exitCode,
+        stderr: reset.stderr,
+      });
+    }
+  }
+
+  const committed = await git(repoDir, ["commit", "--quiet", "-m", message]);
+  if (committed.exitCode !== 0) {
+    throw new InternalError(`git commit failed in ${repoDir}: ${committed.stderr.trim() || committed.stdout.trim()}`, {
+      repoDir,
+      exitCode: committed.exitCode,
+      stderr: committed.stderr,
+      stdout: committed.stdout,
+    });
+  }
+
+  return revParse(repoDir, "HEAD");
+}
+
+/**
  * `git show -s --format=%B <oid>`, called once per OID (never batched with a separator, which
  * could appear inside a message body). Returns each commit's full raw message body, in the same
  * order as `oids`.

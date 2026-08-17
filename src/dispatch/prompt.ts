@@ -103,6 +103,21 @@ export interface ProtocolInstructionParams {
  * retryable R3 refusal it would replace -- so the requirement and its constraint are stated
  * together.
  *
+ * [DECISION] The commit requirement is followed by one explicitly narrow exception, because the
+ * requirement as first written was unsatisfiable for one real provider on one real platform: Codex
+ * CLI runs under `--sandbox workspace-write` unconditionally (`CodexCliAdapter.buildInvocation()`,
+ * PRD §9 FM7), and on Windows that sandbox denies writes to `.git/` outright -- verified directly
+ * against a real repo, where every `git` write returned `fatal: Unable to create
+ * '<repo>/.git/index.lock': Permission denied`. An agent told only "you must commit" and unable to
+ * comply has no honest move left but `status: "blocked"`, which would fail turns whose actual work
+ * was finished. `runTurn()` step 5.5 (`src/dispatch/turn.ts`) now commits such leftovers itself, so
+ * the prompt states the fallback exists. It is worded as *inability*, not permission: the exception
+ * names the concrete failure (git refuses with a permission error), requires attempting the commit
+ * first, and says outright that it does not apply when git works. That deliberate narrowness is a
+ * direct response to the original bug -- a broadly-worded "you don't strictly have to commit" is
+ * exactly the ambiguity that caused a live turn to skip committing entirely, and softening the rule
+ * generally to unblock one sandbox would reintroduce it.
+ *
  * [DECISION] The phase-spec sentence carries the same explicit "and record it in artifacts_read"
  * clause as the `baby_prd.md`/`context.md` sentences, because its absence was genuinely
  * load-bearing in live dispatch: a real Claude Code executor turn read and used all three artifacts
@@ -143,6 +158,18 @@ export function buildProtocolInstructions(p: ProtocolInstructionParams): string 
       "your turn against HEAD after it, and mechanically refuses the entire turn if you report " +
       'status: "completed" with no new commit. Work left uncommitted in the working tree does not ' +
       "count, however genuinely it was done.",
+    "",
+    "There is exactly one exception, and it is narrow: if your own environment physically prevents " +
+      "you from writing to git -- a sandbox that denies write access to the .git directory, so that " +
+      "git itself fails with a permission error you cannot work around -- then leave your finished " +
+      "work in the working tree exactly as it is, say so plainly in work_done, and finish your turn. " +
+      "multi-loopr detects working-tree changes after your process exits and commits them on your " +
+      "behalf. In that specific case only, an uncommitted working tree is not a reason to report " +
+      'status: "blocked": if the actual task the spec asked for is genuinely done, report status: ' +
+      '"completed". This exception is about being unable, never about not having got round to it. ' +
+      "If git works in your environment, the paragraph above applies in full and you must run the " +
+      "commit yourself -- attempt it first, and fall back to this only after git has actually " +
+      "refused you.",
     "",
     "Keep the commit message neutral and factual -- describe the change itself, and add no " +
       "AI-attribution or model-generation trailer of any kind (no co-authored-by line naming an AI " +

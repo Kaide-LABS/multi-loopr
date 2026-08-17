@@ -127,6 +127,42 @@ export const HandoffRecord = HandoffRecordShape.refine(
 /** The inferred type of {@link HandoffRecord}. */
 export type HandoffRecord = z.infer<typeof HandoffRecord>;
 
+/**
+ * [DECISION] The same schema as {@link HandoffRecord} with R1 and R2 intact but **R3 not applied**,
+ * for parsing an agent's raw, pre-reconciliation *draft* only. R3 itself is not modified, relaxed,
+ * or duplicated anywhere -- the rule above is still the single definition, and
+ * `reconcileHandoffRecord()` (`src/dispatch/record.ts`) still re-validates the full
+ * {@link HandoffRecord}, R3 included, after substituting real ground truth. This variant only
+ * changes *when* R3 is applied, never *what* it says.
+ *
+ * Why R3 specifically, and only R3: R1 (`completed_at >= started_at`) and R2 (`halt` iff
+ * `"halted"`) constrain fields the agent genuinely authors and that survive reconciliation
+ * untouched, so checking them on the draft is checking something real. R3 constrains
+ * `repo.commits`, which is *ground truth* -- `reconcileHandoffRecord()` discards the agent's value
+ * wholesale and recomputes it from `git rev-list` (PRD §7 I2: correctness-critical fields never come
+ * from the agent's say-so). Applying R3 to the draft therefore rejects a turn over a number the
+ * agent was explicitly told not to bother getting right ("Recording the wrong commit ids costs you
+ * nothing", `src/dispatch/prompt.ts`) and that is about to be overwritten regardless -- an
+ * always-false-positive check with no true positives available to it.
+ *
+ * This became load-bearing, not merely tidy, once `runTurn()` step 5.5 began committing a turn's
+ * leftovers on the agent's behalf: an agent whose sandbox cannot write to `.git` (codex-cli under
+ * `--sandbox workspace-write` on Windows) truthfully reports `commits: []`, and draft-time R3 would
+ * refuse that record at step 6 -- *before* step 7 could reconcile it against the fallback commit
+ * step 5.5 had already made. The fallback would then be unreachable for exactly the case it exists
+ * to serve, and whether a turn survived would come down to whether the agent happened to invent a
+ * plausible-looking OID instead of reporting honestly. Deferring R3 to reconciliation makes the
+ * outcome depend on the repository's real history rather than on the agent's guess -- which is what
+ * R3 was always meant to test.
+ */
+export const HandoffRecordDraft = HandoffRecordShape.refine(
+  (r) => new Date(r.completed_at).getTime() >= new Date(r.started_at).getTime(),
+  { message: "completed_at must be >= started_at (R1)", path: ["completed_at"] },
+).refine((r) => (r.status === "halted") === (r.halt !== null), {
+  message: 'status === "halted" iff halt !== null (R2)',
+  path: ["halt"],
+});
+
 // ---------------------------------------------------------------------------------------------
 // Isolation denylist (FM2, PRD §7 I5)
 // ---------------------------------------------------------------------------------------------
@@ -181,6 +217,17 @@ function walkForTranscriptFields(value: unknown, pathSegments: readonly string[]
 // Parse / serialise / read / write
 // ---------------------------------------------------------------------------------------------
 
+/** Options for {@link parseHandoffRecord} / {@link readHandoffRecord}. */
+export interface ParseHandoffRecordOptions {
+  /**
+   * Parse against {@link HandoffRecordDraft} instead of {@link HandoffRecord} -- identical except
+   * that R3, the one refinement over a field reconciliation always overwrites, is left for
+   * reconciliation to apply against real ground truth. Default `false`. Pass `true` **only** for an
+   * agent's raw, pre-reconciliation draft; never for a persisted, already-reconciled record.
+   */
+  readonly draft?: boolean;
+}
+
 /**
  * Parses and validates a raw value as a {@link HandoffRecord}. Fixed order of operations
  * (load-bearing, tested):
@@ -189,8 +236,11 @@ function walkForTranscriptFields(value: unknown, pathSegments: readonly string[]
  * 3. Check `schema_version` against {@link RELAY_SCHEMA_VERSION} with a dedicated check (never
  *    falls through to zod for this) -> {@link RelaySchemaError} naming both versions.
  * 4. Full zod parse -> {@link RelaySchemaError} with `z.prettifyError()` output on failure.
+ *
+ * `options.draft` selects {@link HandoffRecordDraft} at step 4; see that schema for why exactly one
+ * refinement (R3) is deferred, and why deferring it strengthens rather than weakens the check.
  */
-export function parseHandoffRecord(raw: unknown): HandoffRecord {
+export function parseHandoffRecord(raw: unknown, options: ParseHandoffRecordOptions = {}): HandoffRecord {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new RelaySchemaError("HandoffRecord payload must be a JSON object.", {
       receivedType: Array.isArray(raw) ? "array" : typeof raw,
@@ -208,7 +258,8 @@ export function parseHandoffRecord(raw: unknown): HandoffRecord {
     );
   }
 
-  const result = HandoffRecord.safeParse(raw);
+  const schema = options.draft === true ? HandoffRecordDraft : HandoffRecord;
+  const result = schema.safeParse(raw);
   if (!result.success) {
     throw new RelaySchemaError(z.prettifyError(result.error));
   }
@@ -258,9 +309,14 @@ export function serialiseHandoffRecord(rec: HandoffRecord): string {
 
 /**
  * Reads a UTF-8 JSON file at `absPath` and validates it as a {@link HandoffRecord}. A JSON parse
- * failure is a {@link RelaySchemaError}, not an internal error.
+ * failure is a {@link RelaySchemaError}, not an internal error. `options` is forwarded verbatim to
+ * {@link parseHandoffRecord}; the default (no options) is the full, R3-inclusive schema, so every
+ * existing caller reading an already-reconciled record on disk is unaffected.
  */
-export async function readHandoffRecord(absPath: string): Promise<HandoffRecord> {
+export async function readHandoffRecord(
+  absPath: string,
+  options: ParseHandoffRecordOptions = {},
+): Promise<HandoffRecord> {
   const text = await readFile(absPath, "utf8");
   let raw: unknown;
   try {
@@ -271,7 +327,7 @@ export async function readHandoffRecord(absPath: string): Promise<HandoffRecord>
       { path: absPath },
     );
   }
-  return parseHandoffRecord(raw);
+  return parseHandoffRecord(raw, options);
 }
 
 /** Writes a {@link HandoffRecord} to `absPath`, creating parent directories as needed. */

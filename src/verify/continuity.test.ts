@@ -13,7 +13,7 @@ import type { HandoffRecord } from "../domain/relay.ts";
 import { runProcess } from "../util/exec.ts";
 import { sha256File, sha256String } from "../util/hash.ts";
 import { CONTINUITY_CHECKS, verifyContinuation } from "./continuity.ts";
-import { commitsBetween, currentBranch, revParse } from "./git.ts";
+import { changedPaths, commitsBetween, currentBranch, revParse, stageAllAndCommit, workingTreeChanges } from "./git.ts";
 
 const GIT_TIMEOUT_MS = 30_000;
 
@@ -372,6 +372,204 @@ test("commitsBetween returns an oldest-first list, and an empty array for an emp
 
     assert.deepStrictEqual(await commitsBetween(dir, commit0, commit2), [commit1, commit2]);
     assert.deepStrictEqual(await commitsBetween(dir, commit2, commit2), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// workingTreeChanges / stageAllAndCommit -- the working-tree primitives runTurn()'s step 5.5
+// fallback commit is built on. Every case below uses a real, disposable git repo, and every probe
+// under test is plumbing or an exit-code-only predicate (`git diff --quiet`, `git ls-files
+// --others -z`), never `git status --porcelain` -- see git.ts's file header.
+// -------------------------------------------------------------------------------------------
+
+test("workingTreeChanges reports a genuinely clean tree as having nothing at all", async () => {
+  const dir = await freshRepo();
+  try {
+    await commitFiles(dir, { "foo.txt": "v0\n" }, "initial");
+
+    const changes = await workingTreeChanges(dir);
+    assert.equal(changes.hasAny, false);
+    assert.equal(changes.trackedModified, false);
+    assert.equal(changes.staged, false);
+    assert.deepStrictEqual(changes.untracked, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("workingTreeChanges detects each of the three change kinds independently: unstaged, staged, untracked", async () => {
+  const dir = await freshRepo();
+  try {
+    await commitFiles(dir, { "foo.txt": "v0\n" }, "initial");
+
+    // 1. An unstaged edit to a tracked file.
+    await writeFile(`${dir}/foo.txt`, "v1\n", "utf8");
+    let changes = await workingTreeChanges(dir);
+    assert.deepStrictEqual(
+      { trackedModified: changes.trackedModified, staged: changes.staged, untracked: changes.untracked },
+      { trackedModified: true, staged: false, untracked: [] },
+    );
+    assert.equal(changes.hasAny, true);
+
+    // 2. The same edit, now staged but not committed -- a different probe entirely (--cached).
+    await git(dir, ["add", "foo.txt"]);
+    changes = await workingTreeChanges(dir);
+    assert.deepStrictEqual(
+      { trackedModified: changes.trackedModified, staged: changes.staged, untracked: changes.untracked },
+      { trackedModified: false, staged: true, untracked: [] },
+    );
+
+    // 3. A brand-new file git does not track yet -- invisible to both diff probes above, which is
+    // exactly why the untracked probe is not optional: an agent's newly created file lands here.
+    await mkdir(`${dir}/deep`, { recursive: true });
+    await writeFile(`${dir}/deep/new.txt`, "brand new\n", "utf8");
+    changes = await workingTreeChanges(dir);
+    assert.deepStrictEqual(changes.untracked, ["deep/new.txt"]);
+    assert.equal(changes.hasAny, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("workingTreeChanges sees an untracked file alone as a change, with both diff probes clean", async () => {
+  const dir = await freshRepo();
+  try {
+    await commitFiles(dir, { "foo.txt": "v0\n" }, "initial");
+    await writeFile(`${dir}/only-new.txt`, "new\n", "utf8");
+
+    const changes = await workingTreeChanges(dir);
+    assert.equal(changes.trackedModified, false);
+    assert.equal(changes.staged, false);
+    assert.deepStrictEqual(changes.untracked, ["only-new.txt"]);
+    assert.equal(changes.hasAny, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("workingTreeChanges honours .gitignore via --exclude-standard, and excludeDirs via an exclude pathspec", async () => {
+  const dir = await freshRepo();
+  try {
+    await commitFiles(dir, { ".gitignore": "ignored-build/\n" }, "initial");
+    await mkdir(`${dir}/ignored-build`, { recursive: true });
+    await writeFile(`${dir}/ignored-build/out.bin`, "junk\n", "utf8");
+    await mkdir(`${dir}/.multi-loopr/runs/r/handoff/1`, { recursive: true });
+    await writeFile(`${dir}/.multi-loopr/runs/r/handoff/1/000-executor-codex-cli.json`, "{}\n", "utf8");
+
+    // .gitignore'd output never counts, and .multi-loopr/ is excluded by pathspec -- so a repo
+    // whose only "changes" are multi-loopr's own bookkeeping still reads as clean.
+    assert.equal((await workingTreeChanges(dir, [".multi-loopr"])).hasAny, false);
+    // Without the exclusion, the same tree does show multi-loopr's own draft record.
+    assert.deepStrictEqual((await workingTreeChanges(dir)).untracked, [
+      ".multi-loopr/runs/r/handoff/1/000-executor-codex-cli.json",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stageAllAndCommit commits modifications, additions and deletions in one commit, leaving the tree clean", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "v0\n", "gone.txt": "delete me\n" }, "initial");
+    await writeFile(`${dir}/foo.txt`, "v1\n", "utf8");
+    await rm(`${dir}/gone.txt`);
+    await mkdir(`${dir}/deep/nest`, { recursive: true });
+    await writeFile(`${dir}/deep/nest/added.txt`, "added\n", "utf8");
+    await writeFile(`${dir}/with space.txt`, "spaces in the name\n", "utf8");
+
+    const oid = await stageAllAndCommit(dir, "chore: capture leftovers (multi-loopr)");
+
+    assert.match(oid, /^[0-9a-f]{40}$/);
+    assert.equal(oid, await revParse(dir, "HEAD"));
+    assert.deepStrictEqual(await commitsBetween(dir, commit0, oid), [oid]);
+    assert.deepStrictEqual([...(await changedPaths(dir, commit0, oid))].sort(), [
+      "deep/nest/added.txt",
+      "foo.txt",
+      "gone.txt",
+      "with space.txt",
+    ]);
+    assert.equal((await workingTreeChanges(dir)).hasAny, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stageAllAndCommit leaves excludeDirs entirely untouched -- neither staged nor committed", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "v0\n" }, "initial");
+    await writeFile(`${dir}/work.txt`, "real work\n", "utf8");
+    await mkdir(`${dir}/.multi-loopr/runs/r`, { recursive: true });
+    await writeFile(`${dir}/.multi-loopr/runs/r/rec.json`, "{}\n", "utf8");
+
+    const oid = await stageAllAndCommit(dir, "chore: capture leftovers (multi-loopr)", [".multi-loopr"]);
+
+    assert.deepStrictEqual(await changedPaths(dir, commit0, oid), ["work.txt"]);
+    // The excluded directory is still untracked afterwards -- it was never added to the index.
+    assert.deepStrictEqual((await workingTreeChanges(dir)).untracked, [".multi-loopr/runs/r/rec.json"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stageAllAndCommit succeeds when the excluded directory is ALSO listed in the repo's own .gitignore", async () => {
+  // Regression, found in a real end-to-end run: staging via
+  // `git add -A -- ':(top)' ':(exclude,top).multi-loopr'` exits 1 when `.multi-loopr/` is gitignored
+  // too, because naming a path in any pathspec -- even a negative one -- trips git add's
+  // "the following paths are ignored by one of your .gitignore files" check. Staging was correct
+  // regardless, but the non-zero exit made stageAllAndCommit throw and killed the run. Excluding
+  // the target repo's `.multi-loopr/` in .gitignore is the sensible thing for an operator to do,
+  // so this configuration must be the well-trodden path, not the broken one.
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { ".gitignore": ".multi-loopr/\n", "foo.txt": "v0\n" }, "initial");
+    await writeFile(`${dir}/work.txt`, "real work\n", "utf8");
+    await mkdir(`${dir}/.multi-loopr/runs/r`, { recursive: true });
+    await writeFile(`${dir}/.multi-loopr/runs/r/rec.json`, "{}\n", "utf8");
+
+    const oid = await stageAllAndCommit(dir, "chore: capture leftovers (multi-loopr)", [".multi-loopr"]);
+
+    assert.deepStrictEqual(await changedPaths(dir, commit0, oid), ["work.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stageAllAndCommit stages no deletion for an excluded directory that is genuinely tracked in HEAD", async () => {
+  // The other half of the `git reset` undo pass: when the excluded directory already exists in
+  // HEAD, `git add -A` stages its working-tree state and the reset must restore it to HEAD -- not
+  // drop it from the index, which would commit a spurious deletion of tracked files.
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(
+      dir,
+      { "foo.txt": "v0\n", ".multi-loopr/tracked.txt": "tracked before the turn\n" },
+      "initial",
+    );
+    await writeFile(`${dir}/work.txt`, "real work\n", "utf8");
+    await writeFile(`${dir}/.multi-loopr/tracked.txt`, "modified during the turn\n", "utf8");
+
+    const oid = await stageAllAndCommit(dir, "chore: capture leftovers (multi-loopr)", [".multi-loopr"]);
+
+    assert.deepStrictEqual(await changedPaths(dir, commit0, oid), ["work.txt"]);
+    // Still tracked, and its in-tree modification is still uncommitted -- untouched either way.
+    assert.equal((await workingTreeChanges(dir)).trackedModified, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("stageAllAndCommit throws rather than creating an empty commit when there is nothing to commit", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFiles(dir, { "foo.txt": "v0\n" }, "initial");
+
+    await assert.rejects(() => stageAllAndCommit(dir, "chore: nothing to do (multi-loopr)"));
+    // HEAD is unmoved: no empty commit was slipped in before the failure.
+    assert.equal(await revParse(dir, "HEAD"), commit0);
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
