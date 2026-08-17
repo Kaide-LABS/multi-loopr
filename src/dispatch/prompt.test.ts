@@ -93,6 +93,35 @@ test("buildProtocolInstructions contains every mandatory-content item, tested in
   assert.ok(out.includes(".claude/loopr/context.md"));
 });
 
+test("buildProtocolInstructions tells the turn to record every one of the three required loopr artifacts -- the phase spec included -- in artifacts_read", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",
+    role: "executor",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+
+  // Regression: a live dispatched turn genuinely read all three artifacts, but recorded only
+  // baby_prd.md and context.md in artifacts_read -- the two whose sentences asked for it. The
+  // phase-spec sentence said only "read it and do the work", so assertLooprArtifactsReferenced()
+  // (PRD §2 AC3) refused the turn on the missing spec_path. Every "read this artifact" instruction
+  // must now carry the recording requirement, checked the same way for all three.
+  for (const artifactPath of ["PHASE_2_SPEC.md", ".claude/loopr/baby_prd.md", ".claude/loopr/context.md"]) {
+    const instruction = out
+      .split("\n")
+      .find((line) => line.startsWith("Read ") && line.includes(`"${artifactPath}"`));
+    assert.ok(instruction !== undefined, `expected a "Read ..." instruction naming "${artifactPath}"`);
+    assert.ok(
+      instruction.includes("record it in artifacts_read"),
+      `expected the "Read ..." instruction for "${artifactPath}" to require recording it in artifacts_read, got: ${instruction}`,
+    );
+  }
+
+  // The phase spec's own sentence still carries the do-the-work mandate it always had.
+  assert.ok(out.includes('Read the phase spec at repo-relative path "PHASE_2_SPEC.md", do the work it describes, and record it in artifacts_read.'));
+});
+
 test("buildProtocolInstructions states schema_version's exact value shape: the bare integer, never a version string", () => {
   const out = buildProtocolInstructions({
     handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",

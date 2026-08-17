@@ -78,8 +78,9 @@ export interface ProtocolInstructionParams {
  * shape to produce (name *and* value shape per field -- see
  * {@link handoffRecordFieldSpecLines}), where to write it, the isolation rule, the requirement to
  * really commit the turn's work, the advisory-only nature of agent-authored `repo`/`spec_ref`, the
- * honest-halt requirement, and (Phase 4, new) the instruction to genuinely read and record loopr's
- * own `baby_prd.md`/`context.md` for this build. Prose is not fixed verbatim by the spec -- what is
+ * honest-halt requirement, and (Phase 4, new) the instruction to genuinely read and record all
+ * three of loopr's own artifacts for this build -- `baby_prd.md`, `context.md`, *and* the phase spec
+ * itself -- in `artifacts_read`. Prose is not fixed verbatim by the spec -- what is
  * load-bearing is that each of the eight mandatory-content items appears as a literal substring
  * (PHASE_3_SPEC.md §6.2 items 1-6, PHASE_4_SPEC.md §6.2 items 7-8, all tested individually); item
  * 2's eighteen field names now appear as an annotated list rather than a bare comma-joined one,
@@ -100,12 +101,26 @@ export interface ProtocolInstructionParams {
  * commit, and an attribution trailer in that commit is a hard `BoundaryViolationError`
  * (`src/verify/commits.ts`, PRD §7 I4) that fails the run with no retry -- strictly worse than the
  * retryable R3 refusal it would replace -- so the requirement and its constraint are stated
- * together. Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
+ * together.
+ *
+ * [DECISION] The phase-spec sentence carries the same explicit "and record it in artifacts_read"
+ * clause as the `baby_prd.md`/`context.md` sentences, because its absence was genuinely
+ * load-bearing in live dispatch: a real Claude Code executor turn read and used all three artifacts
+ * (its `work_done` narrative and the code it wrote both reflect having read the spec), but its
+ * `artifacts_read` listed only `baby_prd.md` and `context.md` -- the two artifacts whose sentences
+ * asked for the recording -- and `assertLooprArtifactsReferenced()` (`src/dispatch/artifacts.ts`,
+ * PRD §2 AC3) correctly refused the turn on the missing `spec_path`. An instruction that says only
+ * "read X and do the work" is a complete, self-consistent instruction on its own terms; nothing in
+ * it implies a bookkeeping obligation that the two neighbouring sentences state outright. All three
+ * required artifacts are now asked for identically, so the prompt's coverage matches exactly what
+ * `assertLooprArtifactsReferenced()` enforces. Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md
+ * §6.2.
  */
 export function buildProtocolInstructions(p: ProtocolInstructionParams): string {
   return [
     `You are participating in a multi-loopr dispatched ${p.role} turn.`,
-    `Read the phase spec at repo-relative path "${p.specRepoRelPath}" and do the work it describes.`,
+    `Read the phase spec at repo-relative path "${p.specRepoRelPath}", do the work it describes, ` +
+      `and record it in artifacts_read.`,
     "",
     `Read loopr's foundational problem-statement artifact for this build at repo-relative path ` +
       `"${p.babyPrdRepoRelPath}" and record it in artifacts_read.`,
