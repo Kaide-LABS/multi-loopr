@@ -9,10 +9,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { RelaySchemaError } from "../domain/errors.ts";
+import { LooprArtifactBypassError, RelaySchemaError } from "../domain/errors.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
 import { runProcess } from "../util/exec.ts";
 import { sha256File, sha256String } from "../util/hash.ts";
+import { checkC5ArtifactAttestation } from "../verify/continuity.ts";
+import { assertLooprArtifactsReferenced } from "./artifacts.ts";
 import { captureGroundTruthBefore, reconcileHandoffRecord } from "./record.ts";
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -34,6 +36,15 @@ async function initRepo(dir: string): Promise<void> {
 async function commitFile(dir: string, relPath: string, content: string, message: string): Promise<string> {
   await writeFile(`${dir}/${relPath}`, content, "utf8");
   await git(dir, ["add", relPath]);
+  await git(dir, ["commit", "--quiet", "-m", message]);
+  return (await git(dir, ["rev-parse", "HEAD"])).trim();
+}
+
+async function commitFiles(dir: string, files: Readonly<Record<string, string>>, message: string): Promise<string> {
+  for (const [relPath, content] of Object.entries(files)) {
+    await writeFile(`${dir}/${relPath}`, content, "utf8");
+    await git(dir, ["add", relPath]);
+  }
   await git(dir, ["commit", "--quiet", "-m", message]);
   return (await git(dir, ["rev-parse", "HEAD"])).trim();
 }
@@ -168,6 +179,235 @@ test("reconcileHandoffRecord drops (does not fail on) a declared artifact path t
     });
 
     assert.deepStrictEqual(reconciled.artifacts_written, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// artifacts_read is reconciled against ground.headBefore, not end-of-turn disk.
+//
+// These reproduce the live-run defect exactly: turn A wrote `wordcount.mjs` and
+// `wordcount.test.mjs`; turn B genuinely read both, appended a test case to `wordcount.test.mjs`,
+// and committed. Under the old disk-based reconciliation, turn B's `artifacts_read` entry for the
+// file it also modified carried the *post-edit* hash, so `checkC5ArtifactAttestation` reported a
+// stale read -- indistinguishable from never having read it. See `record.ts`'s file header.
+// ---------------------------------------------------------------------------------------------
+
+const WORDCOUNT_V1 = "export function wordcount(s) {\n  return s.split(/\\s+/).filter(Boolean).length;\n}\n";
+const WORDCOUNT_TEST_V1 = "import { wordcount } from './wordcount.mjs';\ntest('counts words', () => {});\n";
+const WORDCOUNT_TEST_V2 = `${WORDCOUNT_TEST_V1}test('counts an empty string', () => {});\n`;
+
+test("reconcileHandoffRecord reconciles artifacts_read against the turn-start commit, so a file this turn also modified keeps the hash it was read at", async () => {
+  const dir = await freshRepo();
+  try {
+    // Turn A (the prior turn): writes both files and commits them as C1.
+    const base = await commitFile(dir, "README.md", "# fixture\n", "base");
+    const c1 = await commitFiles(
+      dir,
+      { "wordcount.mjs": WORDCOUNT_V1, "wordcount.test.mjs": WORDCOUNT_TEST_V1 },
+      "feat: wordcount + its test",
+    );
+    const shaSourceAtC1 = await sha256File(`${dir}/wordcount.mjs`);
+    const shaTestAtC1 = await sha256File(`${dir}/wordcount.test.mjs`);
+
+    const prevRecord = draftRecord({
+      turn_index: 0,
+      repo: { branch: "main", head_before: base, head_after: c1, commits: [c1] },
+      spec_ref: { path: "PHASE_1_SPEC.md", sha256: "9".repeat(64) },
+      artifacts_written: [
+        { path: "wordcount.mjs", sha256: shaSourceAtC1 },
+        { path: "wordcount.test.mjs", sha256: shaTestAtC1 },
+      ],
+    });
+
+    // Turn B: reads both, then legitimately appends a test case to one of them and commits.
+    const c2 = await commitFiles(dir, { "wordcount.test.mjs": WORDCOUNT_TEST_V2 }, "test: add an empty-string case");
+    const shaTestOnDiskAfterTurnB = await sha256File(`${dir}/wordcount.test.mjs`);
+    assert.notEqual(shaTestOnDiskAfterTurnB, shaTestAtC1);
+
+    const draftB = draftRecord({
+      turn_index: 1,
+      // The agent's own hashes are deliberately nonsense: reconciliation must discard them entirely.
+      artifacts_read: [
+        { path: "wordcount.mjs", sha256: "a".repeat(64) },
+        { path: "wordcount.test.mjs", sha256: "b".repeat(64) },
+      ],
+      artifacts_written: [{ path: "wordcount.test.mjs", sha256: "c".repeat(64) }],
+      repo: { branch: "wrong", head_before: "1".repeat(40), head_after: c2, commits: [c2] },
+    });
+
+    const reconciledB = await reconcileHandoffRecord(dir, draftB, {
+      headBefore: c1,
+      branch: "main",
+      specRef: { path: "PHASE_1_SPEC.md", sha256: "9".repeat(64) },
+    });
+
+    // artifacts_read carries the C1-era content hashes -- what turn B actually read.
+    const readSource = reconciledB.artifacts_read.find((r) => r.path === "wordcount.mjs");
+    const readTest = reconciledB.artifacts_read.find((r) => r.path === "wordcount.test.mjs");
+    assert.equal(readSource?.sha256, shaSourceAtC1);
+    assert.equal(readTest?.sha256, shaTestAtC1);
+    assert.notEqual(readTest?.sha256, shaTestOnDiskAfterTurnB);
+
+    // artifacts_written is unchanged in behaviour: still the real, final content on disk.
+    assert.deepStrictEqual(reconciledB.artifacts_written, [
+      { path: "wordcount.test.mjs", sha256: shaTestOnDiskAfterTurnB },
+    ]);
+
+    // The property that failed live: C5 now passes for the modified file as well as the untouched one.
+    const c5 = checkC5ArtifactAttestation(prevRecord, reconciledB);
+    assert.equal(c5.passed, true, JSON.stringify(c5.evidence));
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("FALSIFICATION: the pre-fix, end-of-turn-disk reconciliation of artifacts_read really does fail C5 for a legitimately modified artifact", async () => {
+  const dir = await freshRepo();
+  try {
+    const base = await commitFile(dir, "README.md", "# fixture\n", "base");
+    const c1 = await commitFiles(
+      dir,
+      { "wordcount.mjs": WORDCOUNT_V1, "wordcount.test.mjs": WORDCOUNT_TEST_V1 },
+      "feat: wordcount + its test",
+    );
+    const shaSourceAtC1 = await sha256File(`${dir}/wordcount.mjs`);
+    const shaTestAtC1 = await sha256File(`${dir}/wordcount.test.mjs`);
+
+    const prevRecord = draftRecord({
+      turn_index: 0,
+      repo: { branch: "main", head_before: base, head_after: c1, commits: [c1] },
+      artifacts_written: [
+        { path: "wordcount.mjs", sha256: shaSourceAtC1 },
+        { path: "wordcount.test.mjs", sha256: shaTestAtC1 },
+      ],
+    });
+
+    const c2 = await commitFiles(dir, { "wordcount.test.mjs": WORDCOUNT_TEST_V2 }, "test: add an empty-string case");
+
+    // Reconstructed exactly as the pre-fix code did it: every artifacts_read hash taken from the
+    // working tree at the *end* of the turn. This is the record the old implementation produced.
+    const preFixReconciledB = draftRecord({
+      turn_index: 1,
+      repo: { branch: "main", head_before: c1, head_after: c2, commits: [c2] },
+      artifacts_read: [
+        { path: "wordcount.mjs", sha256: await sha256File(`${dir}/wordcount.mjs`) },
+        { path: "wordcount.test.mjs", sha256: await sha256File(`${dir}/wordcount.test.mjs`) },
+      ],
+      artifacts_written: [{ path: "wordcount.test.mjs", sha256: await sha256File(`${dir}/wordcount.test.mjs`) }],
+    });
+
+    const c5Old = checkC5ArtifactAttestation(prevRecord, preFixReconciledB);
+    assert.equal(c5Old.passed, false);
+    const staleReads = (c5Old.evidence as { staleReads: { path: string; expectedSha256: string; foundSha256: string }[] })
+      .staleReads;
+    // Exactly one stale read, and it is the file the turn legitimately modified -- never the
+    // untouched one, which attests cleanly under both the old and the new behaviour.
+    assert.equal(staleReads.length, 1);
+    assert.equal(staleReads[0]?.path, "wordcount.test.mjs");
+    assert.equal(staleReads[0]?.expectedSha256, shaTestAtC1);
+    assert.notEqual(staleReads[0]?.foundSha256, shaTestAtC1);
+    assert.deepStrictEqual((c5Old.evidence as { unreadPaths: string[] }).unreadPaths, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("reconcileHandoffRecord drops (does not fail on) an artifacts_read path that did not exist at the turn-start commit", async () => {
+  const dir = await freshRepo();
+  try {
+    const commit0 = await commitFile(dir, "existing.txt", "v0\n", "initial");
+    // The turn creates a brand-new file and then over-reports it as something it *read*. A real
+    // read can only ever be of something that already existed when the turn started.
+    const commit1 = await commitFile(dir, "created-by-this-turn.txt", "new\n", "the turn's own commit");
+
+    const draft = draftRecord({
+      artifacts_read: [
+        { path: "existing.txt", sha256: "a".repeat(64) },
+        { path: "created-by-this-turn.txt", sha256: "b".repeat(64) },
+      ],
+      repo: { branch: "main", head_before: commit0, head_after: commit1, commits: [commit1] },
+    });
+    const reconciled = await reconcileHandoffRecord(dir, draft, {
+      headBefore: commit0,
+      branch: "main",
+      specRef: { path: "PHASE_1_SPEC.md", sha256: "9".repeat(64) },
+    });
+
+    assert.deepStrictEqual(reconciled.artifacts_read, [
+      { path: "existing.txt", sha256: sha256String("v0\n") },
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("assertLooprArtifactsReferenced still passes on a reconciled record under commit-based artifacts_read (loopr's static artifacts are unmodified mid-run)", async () => {
+  const dir = await freshRepo();
+  try {
+    const base = await commitFile(dir, "README.md", "# fixture\n", "base");
+    const babyPrd = "# baby prd\nthe product.\n";
+    const context = "# context\nthe conventions.\n";
+    const spec = "# PHASE_1_SPEC\nthe phase.\n";
+    const c1 = await commitFiles(
+      dir,
+      { "baby_prd.md": babyPrd, "context.md": context, "PHASE_1_SPEC.md": spec },
+      "loopr artifacts",
+    );
+    assert.notEqual(base, c1);
+
+    // The turn reads all three loopr artifacts, does real work elsewhere, and commits.
+    const c2 = await commitFiles(dir, { "impl.mjs": "export const x = 1;\n" }, "feat: the turn's work");
+
+    const draft = draftRecord({
+      artifacts_read: [
+        { path: "baby_prd.md", sha256: "a".repeat(64) },
+        { path: "context.md", sha256: "b".repeat(64) },
+        { path: "PHASE_1_SPEC.md", sha256: "c".repeat(64) },
+      ],
+      artifacts_written: [{ path: "impl.mjs", sha256: "d".repeat(64) }],
+      repo: { branch: "main", head_before: c1, head_after: c2, commits: [c2] },
+    });
+    const reconciled = await reconcileHandoffRecord(dir, draft, {
+      headBefore: c1,
+      branch: "main",
+      specRef: { path: "PHASE_1_SPEC.md", sha256: sha256String(spec) },
+    });
+
+    // All three survive reconciliation, and -- because these artifacts are never modified mid-run --
+    // their headBefore-blob hashes are identical to their end-of-turn on-disk hashes, so nothing
+    // about this check's inputs changed.
+    assert.equal(reconciled.artifacts_read.length, 3);
+    for (const [path, content] of [
+      ["baby_prd.md", babyPrd],
+      ["context.md", context],
+      ["PHASE_1_SPEC.md", spec],
+    ] as const) {
+      const entry = reconciled.artifacts_read.find((r) => r.path === path);
+      assert.equal(entry?.sha256, sha256String(content));
+      assert.equal(entry?.sha256, await sha256File(`${dir}/${path}`));
+    }
+
+    assert.doesNotThrow(() => {
+      assertLooprArtifactsReferenced(reconciled, {
+        babyPrdPath: "baby_prd.md",
+        contextPath: "context.md",
+        specPath: "PHASE_1_SPEC.md",
+      });
+    });
+
+    // And the guard still fires when an artifact genuinely was not referenced.
+    assert.throws(
+      () => {
+        assertLooprArtifactsReferenced(reconciled, {
+          babyPrdPath: "baby_prd.md",
+          contextPath: "context.md",
+          specPath: "PHASE_2_SPEC.md",
+        });
+      },
+      (err: unknown) => err instanceof LooprArtifactBypassError,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }

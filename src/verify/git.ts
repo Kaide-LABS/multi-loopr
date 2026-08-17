@@ -102,6 +102,44 @@ export async function blobOidAt(repoDir: string, oid: string, repoRelPath: strin
 }
 
 /**
+ * The content of `repoRelPath` **as it existed at commit `oid`**, or `null` if that path did not
+ * exist at that commit -- deliberately mirroring {@link blobOidAt}'s `null`-on-absent convention,
+ * because callers use "absent at that commit" as a real signal rather than an error (see
+ * `src/dispatch/record.ts`, which drops rather than fails on such an entry).
+ *
+ * Built as two plumbing calls, not one: {@link blobOidAt} (`git rev-parse <oid>:<path>`) resolves
+ * the blob first, which is what supplies the clean absent signal, and `git cat-file blob <blobOid>`
+ * then emits that blob's stored bytes verbatim. `git show <oid>:<path>` would have collapsed both
+ * steps into one command, but at the cost of the distinct absent signal and of `show`'s
+ * user-facing-output remit; `cat-file blob` is the plumbing form whose entire contract is "write
+ * this object's raw content, unmodified" -- it applies no smudge/EOL filter and adds no trailing
+ * newline of its own, so the bytes hash identically to the file `git checkout` of that commit would
+ * produce under a `core.autocrlf`-neutral configuration.
+ *
+ * Returned as a string rather than a `Buffer` because `src/util/exec.ts` -- the only module allowed
+ * to spawn -- decodes child stdout as UTF-8. That is exact for the text artifacts multi-loopr
+ * reconciles (source files, Markdown specs, JSON), and is a deliberate, documented narrowing for a
+ * genuinely binary blob, whose invalid UTF-8 sequences would decode lossily. Requesting a
+ * non-blob object (e.g. a directory path, which resolves to a *tree*) throws {@link InternalError}
+ * rather than returning `null`, matching how the on-disk equivalent (`sha256File` on a directory)
+ * also raises rather than reporting "missing".
+ */
+export async function blobContentAt(repoDir: string, oid: string, repoRelPath: string): Promise<string | null> {
+  const blobOid = await blobOidAt(repoDir, oid, repoRelPath);
+  if (blobOid === null) {
+    return null;
+  }
+  const result = await git(repoDir, ["cat-file", "blob", blobOid]);
+  if (result.exitCode !== 0) {
+    throw new InternalError(
+      `git cat-file blob ${blobOid} (for "${repoRelPath}" at ${oid}) failed in ${repoDir}: ${result.stderr.trim()}`,
+      { repoDir, oid, repoRelPath, blobOid, exitCode: result.exitCode, stderr: result.stderr },
+    );
+  }
+  return result.stdout;
+}
+
+/**
  * `git rev-list --reverse <fromOid>..<toOid>`. Oldest-first list of commit ids; empty output
  * yields an empty array.
  */
@@ -307,6 +345,39 @@ export async function stageAllAndCommit(
   }
 
   return revParse(repoDir, "HEAD");
+}
+
+/**
+ * [DET] `git reset --hard <rev>` -- moves the current branch ref to `rev` and forces **both** the
+ * index and the working tree to match it, the standard destructive form. Any commit on this branch
+ * beyond `rev`, and any uncommitted edit to a tracked file, is discarded outright.
+ *
+ * The single caller is `runTurnLoop`'s continuity-retry path (`src/dispatch/run-loop.ts`), which
+ * rewinds the repository to the last known-good turn's `head_after` before dispatching a retry --
+ * see that call site for the full rationale. Destroying work is the *point* there, not a tolerated
+ * side effect: a non-`CONTINUED` verdict is a deterministic judgement that the attempt's work is
+ * invalid.
+ *
+ * Untracked files are deliberately left alone (`--hard` resets tracked content only; it is not
+ * `git clean`). That is the behaviour this module wants: multi-loopr's own `.multi-loopr/` run
+ * bookkeeping -- including the failed attempt's draft `HandoffRecord`, which
+ * `captureTurnLeftovers()` deliberately never commits -- must survive the rewind so the run's audit
+ * trail stays complete.
+ *
+ * A non-zero exit throws {@link InternalError}, exactly as {@link revParse} does. Every realistic
+ * cause (a bad object, an unwritable index, a locked file) is a genuinely unexpected operator- or
+ * environment-level condition, not a modelled outcome this wrapper should report by returning.
+ */
+export async function resetHard(repoDir: string, rev: string): Promise<void> {
+  const result = await git(repoDir, ["reset", "--hard", "--quiet", rev]);
+  if (result.exitCode !== 0) {
+    throw new InternalError(`git reset --hard ${rev} failed in ${repoDir}: ${result.stderr.trim()}`, {
+      repoDir,
+      rev,
+      exitCode: result.exitCode,
+      stderr: result.stderr,
+    });
+  }
 }
 
 /**

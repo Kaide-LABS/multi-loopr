@@ -11,6 +11,13 @@
 // uncaught-throw error class, `LooprArtifactBypassError`, raised from inside `runTurn` by
 // `assertLooprArtifactsReferenced()`/`assertNextPhaseSpecProduced()` and treated identically --
 // this module still never constructs `RunHaltedError`, and this phase gives no new reason to.
+//
+// This module is also the one place that deliberately *destroys* repository state: before a
+// continuity retry is dispatched, `runTurnLoop` hard-resets `config.repo_dir` back to the last
+// known-good turn's `repo.head_after`, discarding the failed attempt's commits. That is a
+// correctness requirement rather than tidiness -- the retry's continuity verdict is computed
+// against the last-good record, so the retry must actually *start* from that same commit, exactly
+// as a normal turn does. The retry call site carries the full derivation.
 
 import type { AdapterRegistry, ProviderAdapter } from "../ports/provider-adapter.ts";
 import { ADAPTER_REGISTRY } from "../adapters/registry.ts";
@@ -20,7 +27,7 @@ import { ExitCode, LockHeldError, exitCodeFor } from "../domain/errors.ts";
 import { getRole } from "../domain/roles.ts";
 import type { ContinuityVerdict, ContinuityVerdictLabel } from "../verify/continuity.ts";
 import { verifyContinuation } from "../verify/continuity.ts";
-import { diffText } from "../verify/git.ts";
+import { diffText, resetHard } from "../verify/git.ts";
 import { runPreflight } from "../verify/preflight.ts";
 import { acquireRunLock, releaseRunLock } from "../util/lock.ts";
 import { handoffPath, repoRelToAbs } from "../util/paths.ts";
@@ -95,6 +102,17 @@ function buildRetryNote(verdict: ContinuityVerdict): string {
     }
   }
   lines.push("Address these specific issues in this attempt; do not repeat the same mistake.");
+  // Told explicitly because the agent can otherwise observe it and draw the wrong conclusion. The
+  // retry is dispatched only after `runTurnLoop` has hard-reset the repository to the last
+  // known-good commit, so the failed attempt's commit is genuinely absent from `git log` by the
+  // time this agent could look. Without this line, an agent that does inspect history sees a repo
+  // with no trace of the work this very notice is critiquing -- and might "helpfully" try to revert
+  // or fix up a commit that no longer exists, or conclude the notice is stale and ignore it.
+  lines.push(
+    "The repository has already been reset to the last known-good commit, so the failed attempt's " +
+      "changes and commits no longer exist -- do not try to revert or repair them. Start from the " +
+      "current state and do the work again, correctly.",
+  );
   return lines.join("\n");
 }
 
@@ -237,8 +255,9 @@ async function runExtendedPreflight(
 /**
  * The top-level orchestrator: extended preflight, run lock, then the fixed three-slot turn loop
  * (planning, prompt assembly, spawn, ground-truth reconciliation, neutrality assertion, continuity
- * gating with exactly one bounded retry scoped to a non-`CONTINUED` verdict, halt propagation).
- * Implements PHASE_3_SPEC.md §6.5.
+ * gating with exactly one bounded retry scoped to a non-`CONTINUED` verdict -- preceded by a hard
+ * reset of the repository to the last known-good commit, see `runTurnLoop`'s retry path -- and halt
+ * propagation). Implements PHASE_3_SPEC.md §6.5.
  */
 export async function runDispatch(config: RunConfig, deps?: RunDispatchDeps): Promise<RunResult> {
   const preflight = await runExtendedPreflight(config, deps?.preflightFn ?? runPreflight);
@@ -361,6 +380,39 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
       continuityVerdict: verdict.verdict,
       retried: false,
     });
+
+    // [Live-run bug, fixed here.] Rewind the repository to the last known-good commit before the
+    // retry is dispatched. This is required for correctness, not hygiene.
+    //
+    // The retry is dispatched with `prevRecord` unchanged -- still the last *genuinely good*
+    // record, never the failed attempt's own -- and its verdict is computed against that same
+    // record (`verifyContinuation(config.repo_dir, prevRecord, retryRecord)` below). But the failed
+    // attempt's commits were real commits and, without this reset, remain the real HEAD. So
+    // `captureGroundTruthBefore()` inside `runTurn` would capture the *failed* attempt's
+    // `head_after` as the retry's `ground.headBefore`, and `reconcileHandoffRecord()`
+    // (`src/dispatch/record.ts`) reconciles `artifacts_read` against exactly that commit. The retry
+    // would therefore be hashed against the bad/reverted content while
+    // `checkC5ArtifactAttestation` compared it to `prevRecord.artifacts_written` -- two different
+    // baselines, so C5 could never pass for a retry, structurally, no matter what the retry agent
+    // did. Resetting restores the invariant every normal turn already enjoys: `ground.headBefore`
+    // equals the comparison record's `repo.head_after`.
+    //
+    // Discarding the failed attempt's commits is the correct semantic, not collateral damage: a
+    // REDO/PARTIAL_REVERT/IGNORED/DIVERGED verdict is a deterministic judgement that this attempt's
+    // work is invalid, and leaving it in history would only give the retry invalid work to build on
+    // top of. `resetHard` leaves untracked files alone, so `.multi-loopr/`'s run bookkeeping --
+    // including the failed attempt's own persisted record -- survives for the audit trail.
+    //
+    // `prevRecord` is necessarily non-null here (the `prevRecord === null` branch above `continue`s
+    // before ever reaching a verdict), and every non-null `prevRecord` is a *reconciled* record
+    // whose `repo.head_after` came from `revParse(repoDir, "HEAD")` -- so a first-record-with-no-
+    // meaningful-`head_after` state is unreachable rather than merely unlikely, and no guard for it
+    // could be exercised. A genuine reset failure (bad object, unwritable index, a file locked by
+    // another process) throws `InternalError` and propagates uncaught, matching this module's
+    // treatment of every other unexpected condition; `runDispatch`'s `finally` still releases the
+    // run lock. Continuing with a half-rewound repository would be strictly worse -- it would
+    // produce a misleading CONTINUITY_FAILED two turns later instead of naming the real fault.
+    await resetHard(config.repo_dir, prevRecord.repo.head_after);
 
     const retryTurnIndex = attemptCounter;
     attemptCounter += 1;

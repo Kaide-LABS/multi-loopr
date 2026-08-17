@@ -48,22 +48,32 @@ async function freshRepo(): Promise<string> {
 }
 
 /**
- * Writes multi-loopr's three canonical loopr artifacts (`baby_prd.md`, `context.md`, and a spec
- * file matching `baseReq()`'s own `specRef.path`/`babyPrdPath`/`contextPath` defaults) as real files
- * on disk (not necessarily committed -- `reconcileFileRefs`, Phase 3, unmodified, hashes from disk
- * regardless of git state) and returns their `FileRef`s so a test can populate a draft's
- * `artifacts_read` with entries that survive ground-truth reconciliation (PHASE_4_SPEC.md §6.1:
- * `assertLooprArtifactsReferenced()` only accepts a *reconciled* record's `artifacts_read`, and a
- * reconciled entry only survives if its path resolves to a real file).
+ * Writes **and commits** multi-loopr's three canonical loopr artifacts (`baby_prd.md`,
+ * `context.md`, and a spec file matching `baseReq()`'s own `specRef.path`/`babyPrdPath`/
+ * `contextPath` defaults), returning their `FileRef`s plus the resulting HEAD, so a test can
+ * populate a draft's `artifacts_read` with entries that survive ground-truth reconciliation
+ * (PHASE_4_SPEC.md §6.1: `assertLooprArtifactsReferenced()` only accepts a *reconciled* record's
+ * `artifacts_read`, and a reconciled entry only survives if its path resolves).
+ *
+ * The commit is load-bearing, and was not always: `artifacts_read` is now reconciled against the
+ * turn's *starting commit* rather than end-of-turn disk (`src/dispatch/record.ts`), so a loopr
+ * artifact merely present as an uncommitted working-tree file does not resolve at `headBefore` and
+ * is dropped. Committing them is also what a real run always looks like -- the loopr artifacts are
+ * tracked repository files the operator points the run at, produced by earlier phases.
  */
-async function writeLooprArtifacts(dir: string): Promise<{ babyPrd: FileRef; context: FileRef; spec: FileRef }> {
+async function writeLooprArtifacts(
+  dir: string,
+): Promise<{ babyPrd: FileRef; context: FileRef; spec: FileRef; head: string }> {
   await writeFile(`${dir}/baby_prd.md`, "baby prd content\n", "utf8");
   await writeFile(`${dir}/context.md`, "context content\n", "utf8");
   await writeFile(`${dir}/PHASE_1_SPEC.md`, "spec content\n", "utf8");
+  await git(dir, ["add", "baby_prd.md", "context.md", "PHASE_1_SPEC.md"]);
+  await git(dir, ["commit", "--quiet", "-m", "add the run's loopr artifacts"]);
   return {
     babyPrd: { path: "baby_prd.md", sha256: await sha256File(`${dir}/baby_prd.md`) },
     context: { path: "context.md", sha256: await sha256File(`${dir}/context.md`) },
     spec: { path: "PHASE_1_SPEC.md", sha256: await sha256File(`${dir}/PHASE_1_SPEC.md`) },
+    head: (await git(dir, ["rev-parse", "HEAD"])).trim(),
   };
 }
 
@@ -161,7 +171,10 @@ test("runTurn: happy path reconciles and persists the record, overwriting the ag
     assert.equal(result.outcome.ok, true);
     assert.ok(result.record !== null);
     assert.equal(result.record?.repo.branch, "main");
-    assert.equal(result.record?.repo.head_before, commit0);
+    // The turn starts from the loopr-artifacts commit, which is the real HEAD by the time runTurn
+    // captures ground truth (the artifacts must be committed to be attestable as read at all).
+    assert.notEqual(artifacts.head, commit0);
+    assert.equal(result.record?.repo.head_before, artifacts.head);
     assert.notEqual(result.record?.repo.head_after, "2".repeat(40));
     assert.deepStrictEqual(result.record?.spec_ref, req.specRef);
   } finally {
@@ -515,8 +528,8 @@ test("runTurn: a turn that leaves uncommitted changes gets them committed by mul
     // R3 is now genuinely satisfiable: reconciliation, which reads HEAD itself at call time, sees
     // the fallback commit because step 5.5 ran before it.
     assert.equal(result.record?.repo.commits.length, 1);
-    assert.equal(result.record?.repo.head_before, commit0);
-    assert.notEqual(result.record?.repo.head_after, commit0);
+    assert.equal(result.record?.repo.head_before, artifacts.head);
+    assert.notEqual(result.record?.repo.head_after, artifacts.head);
     assert.equal(result.record?.status, "completed");
 
     // Both kinds of leftover really made it into that one commit.
@@ -591,13 +604,10 @@ test("runTurn: a turn that genuinely changes nothing still reconciles to commits
   const dir = await freshRepo();
   try {
     const commit0 = await commitFile(dir, "foo.txt", "v0\n", "initial");
-    // Loopr's three artifacts are committed here (not merely written), so that writing the handoff
-    // record is the *only* thing that touches the tree during the turn -- and that lives under
-    // .multi-loopr/, which step 5.5 excludes. A genuinely idle turn must stay at zero commits.
-    await writeLooprArtifacts(dir);
-    await git(dir, ["add", "-A"]);
-    await git(dir, ["commit", "--quiet", "-m", "loopr artifacts"]);
-    const base = (await git(dir, ["rev-parse", "HEAD"])).trim();
+    // Loopr's three artifacts are committed by the helper (not merely written), so that writing the
+    // handoff record is the *only* thing that touches the tree during the turn -- and that lives
+    // under .multi-loopr/, which step 5.5 excludes. A genuinely idle turn must stay at zero commits.
+    const base = (await writeLooprArtifacts(dir)).head;
     assert.notEqual(base, commit0);
 
     const req = baseReq({ repoDir: dir });

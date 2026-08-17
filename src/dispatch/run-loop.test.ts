@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { BoundaryViolationError, InternalError, LooprArtifactBypassError, TurnTimeoutError } from "../domain/errors.ts";
 import type { FileRef, HaltSignal, HandoffRecord } from "../domain/relay.ts";
-import { writeHandoffRecord } from "../domain/relay.ts";
+import { readHandoffRecord, writeHandoffRecord } from "../domain/relay.ts";
 import type { ProviderId, RawInvocationResult, RunConfig, TurnOutcome, TurnRequest } from "../domain/run.ts";
 import type { AdapterRegistry, Invocation, PreflightReport, ProviderAdapter } from "../ports/provider-adapter.ts";
 import { runProcess } from "../util/exec.ts";
@@ -18,6 +18,7 @@ import { acquireRunLock, readRunLock, releaseRunLock } from "../util/lock.ts";
 import { handoffPath } from "../util/paths.ts";
 import { sha256File } from "../util/hash.ts";
 import type { PreflightSummary } from "../verify/preflight.ts";
+import { checkC5ArtifactAttestation, verifyContinuation } from "../verify/continuity.ts";
 import { nextPhaseSpecPath } from "./artifacts.ts";
 import { runDispatch } from "./run-loop.ts";
 
@@ -349,6 +350,133 @@ test("runDispatch: a continuity failure retries exactly once and succeeds", asyn
   }
 });
 
+test("runDispatch: before a retry is dispatched the repo is hard-reset to the last known-good commit, so a retry that re-reads AND modifies the prior turn's artifact still passes C5", async () => {
+  // The third and final layer of today's live-run bug chain, and the one shape that was
+  // *structurally* impossible to pass before the reset existed.
+  //
+  // `reconcileHandoffRecord()` reconciles `artifacts_read` against `ground.headBefore` -- the real
+  // commit the turn started from -- while `verifyContinuation()` compares the retry against
+  // `prevRecord`, the last *genuinely good* record. For a normal turn those are the same commit.
+  // For a retry they were not: the failed attempt's commits were never undone, so the retry's real
+  // `headBefore` was the failed attempt's `head_after`, and `artifacts_read` got hashed against the
+  // bad content while C5 expected the last-good content. No retry agent behaviour could fix that.
+  //
+  // The fixture below is deliberately the read-then-modify shape (the retry reads `foo.txt` as
+  // turn 0 wrote it and then appends to it), because that is what makes the two baselines produce
+  // provably different hashes rather than coincidentally equal ones. Falsified by deleting the
+  // `resetHard(config.repo_dir, prevRecord.repo.head_after)` call in `runTurnLoop`: this test then
+  // fails with exitCode 6 (CONTINUITY_FAILED) and a retry verdict of IGNORED on C5.
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir);
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    const FOO_V1 = "v1\n";
+    const FOO_RETRY = "v1\nappended by the retry\n";
+
+    // Held on an object rather than in three `let`s: TypeScript's flow analysis narrows a `let`
+    // that is only ever reassigned inside a callback back to its initialiser's type at the
+    // assertion sites below, which would make every comparison here vacuous.
+    const observed = { turn0HeadAfter: "", badAttemptHeadAfter: "", headSeenAtRetryDispatch: "" };
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        observed.turn0HeadAfter = await commitFile(dir, "foo.txt", FOO_V1, "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        // Bad attempt: reverts foo.txt entirely -> C3_NO_REVERT all-reverted -> REDO.
+        observed.badAttemptHeadAfter = await commitFile(dir, "foo.txt", "v0\n", "turn1 (bad, reverts turn0)");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
+        );
+      } else if (step === 2) {
+        // The retry. Observed *inside* the spawn seam, i.e. at exactly the moment the retry agent's
+        // own process would start -- this is the real git state the retry runs against, and the
+        // same state `captureGroundTruthBefore()` has just recorded as its `headBefore`.
+        observed.headSeenAtRetryDispatch = (await git(dir, ["rev-parse", "HEAD"])).trim();
+        // Reads foo.txt as turn 0 left it and *modifies* it -- entirely legitimate work, and the
+        // exact case the end-of-turn-disk reconciliation used to make unattestable.
+        await commitFile(dir, "foo.txt", FOO_RETRY, "turn1 retry (good: extends turn0's file)");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2 (reviewer, turnIndex 3)");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 3, "reviewer", "claude-code"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.exitCode, 0);
+    assert.deepStrictEqual(
+      result.turns.map((t) => [t.turnIndex, t.continuityVerdict, t.retried]),
+      [
+        [0, null, false],
+        [1, "REDO", false],
+        [2, "CONTINUED", true],
+        [3, "CONTINUED", false],
+      ],
+    );
+
+    // (1) The real git state the retry started from. Not the failed attempt's commit -- the last
+    // known-good one, which is precisely the record continuity compares the retry against.
+    assert.notEqual(observed.badAttemptHeadAfter, observed.turn0HeadAfter);
+    assert.equal(observed.headSeenAtRetryDispatch, observed.turn0HeadAfter);
+    assert.notEqual(observed.headSeenAtRetryDispatch, observed.badAttemptHeadAfter);
+
+    // (2) The same fact as the retry's own reconciled record sees it.
+    const turn0Record = await readHandoffRecord(handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"));
+    const retryRecord = await readHandoffRecord(handoffPath(dir, RUN_ID, 1, 2, "executor", "codex-cli"));
+    assert.equal(retryRecord.repo.head_before, turn0Record.repo.head_after);
+
+    // (3) The retry genuinely read turn 0's version of foo.txt and wrote a different one -- the
+    // read-then-modify shape. If these two hashes were equal the test would prove nothing.
+    const readFoo = retryRecord.artifacts_read.find((r) => r.path === "foo.txt");
+    const writtenFoo = retryRecord.artifacts_written.find((r) => r.path === "foo.txt");
+    assert.equal(readFoo?.sha256, turn0Record.artifacts_written.find((r) => r.path === "foo.txt")?.sha256);
+    assert.notEqual(writtenFoo?.sha256, readFoo?.sha256);
+
+    // (4) And C5/the full verdict pass on their own, re-run directly against the persisted records.
+    assert.equal(checkC5ArtifactAttestation(turn0Record, retryRecord).passed, true);
+    assert.equal((await verifyContinuation(dir, turn0Record, retryRecord)).verdict, "CONTINUED");
+
+    // (5) The failed attempt's commit really is gone from the branch it was made on.
+    const log = await git(dir, ["log", "--format=%H"]);
+    assert.ok(log.includes(observed.turn0HeadAfter));
+    assert.ok(!log.includes(observed.badAttemptHeadAfter));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
 test("runDispatch: a continuity failure on both the original and the retry halts at CONTINUITY_FAILED (6)", async () => {
   const dir = await freshRepoWithSpec();
   try {
@@ -379,10 +507,17 @@ test("runDispatch: a continuity failure on both the original and the retry halts
           draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
         );
       } else {
-        // Retry (turnIndex 2): never touches foo.txt again, so it stays reverted relative to
-        // turn0 -- still needs its own real commit (R3), on an unrelated file, to stay distinct
-        // from an empty (nothing-to-commit) git operation.
-        await commitFile(dir, `noise-${String(step)}.txt`, "noise\n", `turn1 attempt ${String(step)} (bad, still reverted)`);
+        // Retry (turnIndex 2): reverts foo.txt to its pre-turn0 content *again*, which is what it
+        // now takes to stay a REDO. Merely not touching foo.txt is no longer enough: `runTurnLoop`
+        // hard-resets the repository to turn0's own commit before dispatching the retry, so the
+        // original attempt's revert has already been undone and the retry starts from a repo where
+        // foo.txt is v1. It also commits an unrelated file, preserving this fixture's original
+        // point that the attempt makes a real commit (R3) rather than an empty git operation.
+        await commitFiles(
+          dir,
+          { "foo.txt": "v0\n", [`noise-${String(step)}.txt`]: "noise\n" },
+          `turn1 attempt ${String(step)} (bad, reverts turn0 again)`,
+        );
         await writeHandoffRecord(
           handoffPath(dir, RUN_ID, 1, step, "executor", "codex-cli"),
           draft({ artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }] }),
