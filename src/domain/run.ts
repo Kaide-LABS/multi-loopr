@@ -80,7 +80,7 @@ export const RunConfig = z.strictObject({
     .refine(([a, b]) => a !== b, "executor_providers must be two different provider ids"),
   reviewer_provider: ProviderIdSchema.nullable().default(null),
   turn_timeout_ms: z.number().int().min(1000).max(7_200_000).default(1_800_000),
-  model_overrides: z.record(ProviderIdSchema, z.string().min(1)).optional(),
+  model_overrides: z.partialRecord(ProviderIdSchema, z.string().min(1)).optional(),
   /** Which loopr phase this run dispatches (PHASE_3_SPEC.md §1.3). */
   phase: z.number().int().min(1),
   /** Repo-relative path to the `PHASE_N_SPEC.md` this run's turns work from (PHASE_3_SPEC.md §1.3). */

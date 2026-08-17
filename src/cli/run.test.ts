@@ -328,6 +328,32 @@ test("RunConfig.is_final_phase defaults to false when omitted, and accepts an ex
   assert.equal(explicitTrue.success ? explicitTrue.data.is_final_phase : undefined, true);
 });
 
+test("RunConfig.model_overrides accepts a sparse record (one provider key set, the other omitted)", () => {
+  const base = {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+  };
+  const omitted = RunConfig.safeParse(base);
+  assert.equal(omitted.success, true);
+  assert.equal(omitted.success ? omitted.data.model_overrides : undefined, undefined);
+
+  const oneKey = RunConfig.safeParse({ ...base, model_overrides: { "claude-code": "opus" } });
+  assert.equal(oneKey.success, true);
+  assert.deepEqual(oneKey.success ? oneKey.data.model_overrides : undefined, { "claude-code": "opus" });
+
+  const bothKeys = RunConfig.safeParse({ ...base, model_overrides: { "claude-code": "opus", "codex-cli": "gpt-5.6-terra" } });
+  assert.equal(bothKeys.success, true);
+  assert.deepEqual(bothKeys.success ? bothKeys.data.model_overrides : undefined, { "claude-code": "opus", "codex-cli": "gpt-5.6-terra" });
+
+  assert.equal(RunConfig.safeParse({ ...base, model_overrides: { "claude-code": "" } }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, model_overrides: { "not-a-real-provider": "opus" } }).success, false);
+});
+
 test("runRunCommand dispatches a valid config and returns a RunReport whose exit_code passes through runDispatch's own result", async () => {
   // Drives runRunCommand through an injected fake `deps: RunDispatchDeps` -- a fake, always-healthy
   // preflight plus a fake AdapterRegistry/runProcessFn standing in for a real provider CLI, mirroring
