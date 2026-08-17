@@ -6,29 +6,58 @@
 // step upstream of it.
 
 import type { HandoffRecord } from "../domain/relay.ts";
+import { RELAY_SCHEMA_VERSION } from "../domain/relay.ts";
 import { getRole } from "../domain/roles.ts";
+import { PROVIDER_IDS } from "../domain/run.ts";
+import { MODEL_TIERS } from "../domain/tiers.ts";
 
-/** The eighteen top-level `HandoffRecord` field names, in schema-declaration order (PHASE_1_SPEC.md §3.4). */
-const HANDOFF_RECORD_FIELD_NAMES = [
-  "schema_version",
-  "run_id",
-  "phase",
-  "turn_index",
-  "role",
-  "provider",
-  "model_tier",
-  "started_at",
-  "completed_at",
-  "repo",
-  "spec_ref",
-  "artifacts_read",
-  "artifacts_written",
-  "status",
-  "work_done",
-  "next_steps",
-  "open_questions",
-  "halt",
-] as const;
+function quotedList(values: readonly string[]): string {
+  return values.map((v) => `"${v}"`).join(", ");
+}
+
+/**
+ * The eighteen top-level `HandoffRecord` fields, in schema-declaration order (PHASE_1_SPEC.md
+ * §3.4), each annotated with the *value shape* it must carry -- not merely its name.
+ *
+ * [DECISION] The bare name list this replaced was genuinely ambiguous in live dispatch: a real
+ * Claude Code executor turn wrote `"schema_version": "1.0"` (a plausible semver-looking string, the
+ * overwhelmingly common convention for a field with that name) where the schema requires the bare
+ * integer `1`, and the relay's own validation correctly refused the turn. A field name alone does
+ * not communicate a value shape, so every field states one, and the literals are read from the
+ * canonical schemas (`RELAY_SCHEMA_VERSION`, `PROVIDER_IDS`, `MODEL_TIERS`) rather than duplicated,
+ * so the prompt cannot drift from what `parseHandoffRecord()` actually enforces.
+ */
+function handoffRecordFieldSpecLines(role: "executor" | "reviewer"): readonly string[] {
+  return [
+    `- schema_version: the bare JSON integer ${String(RELAY_SCHEMA_VERSION)} -- no quotes, no ` +
+      `decimal point. This is a schema revision number, not a semver string: "1.0", "1.0.0", and ` +
+      `the quoted string "${String(RELAY_SCHEMA_VERSION)}" are all rejected outright.`,
+    "- run_id: this run's UUID string. It is the directory name directly under runs/ in the " +
+      "handoff path above -- copy it from there, do not invent one.",
+    "- phase: a bare integer >= 1 (no quotes). It is the directory name directly under handoff/ " +
+      "in the handoff path above.",
+    "- turn_index: a bare integer >= 0 (no quotes). The handoff file name starts with this number " +
+      "zero-padded; write the field itself as a plain integer, so 000 in the file name is 0 here.",
+    `- role: exactly "executor" or "reviewer". For this turn it is "${role}".`,
+    `- provider: exactly one of ${quotedList(PROVIDER_IDS)} -- whichever of them appears in the ` +
+      "handoff file name above.",
+    `- model_tier: exactly one of ${quotedList(MODEL_TIERS)}.`,
+    '- started_at, completed_at: ISO-8601 UTC timestamp strings ending in "Z", for example ' +
+      '"2026-01-01T09:30:00Z". A numeric offset such as +01:00 is rejected. completed_at must be ' +
+      ">= started_at.",
+    "- repo: an object with branch (string), head_before, head_after (full git object ids), and " +
+      "commits (array of full git object ids).",
+    "- spec_ref: an object with path (repo-relative POSIX path) and sha256 (64 lowercase hex " +
+      "characters).",
+    "- artifacts_read, artifacts_written: arrays (possibly empty) of objects with the same " +
+      "path/sha256 shape as spec_ref.",
+    '- status: exactly one of "completed", "blocked", "halted".',
+    "- work_done: a single non-empty string.",
+    "- next_steps, open_questions: arrays of strings, each array possibly empty.",
+    "- halt: null, or an object with code (an UPPER_SNAKE_CASE identifier string) and message (a " +
+      'non-empty string). It must be non-null exactly when status is "halted", and null otherwise.',
+  ];
+}
 
 /** A very large diff would make an invocation's `stdin` payload unboundedly large; capped here. */
 const DIFF_CAP_CHARS = 20_000;
@@ -46,12 +75,16 @@ export interface ProtocolInstructionParams {
 
 /**
  * Renders the protocol instructions every dispatched turn receives: the exact `HandoffRecord`
- * shape to produce, where to write it, the isolation rule, the advisory-only nature of
- * agent-authored `repo`/`spec_ref`, the honest-halt requirement, and (Phase 4, new) the instruction
- * to genuinely read and record loopr's own `baby_prd.md`/`context.md` for this build. Prose is not
- * fixed verbatim by the spec -- what is load-bearing is that each of the eight mandatory-content
- * items appears as a literal substring (PHASE_3_SPEC.md §6.2 items 1-6, PHASE_4_SPEC.md §6.2 items
- * 7-8, all tested individually). Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
+ * shape to produce (name *and* value shape per field -- see
+ * {@link handoffRecordFieldSpecLines}), where to write it, the isolation rule, the advisory-only
+ * nature of agent-authored `repo`/`spec_ref`, the honest-halt requirement, and (Phase 4, new) the
+ * instruction to genuinely read and record loopr's own `baby_prd.md`/`context.md` for this build.
+ * Prose is not fixed verbatim by the spec -- what is load-bearing is that each of the eight
+ * mandatory-content items appears as a literal substring (PHASE_3_SPEC.md §6.2 items 1-6,
+ * PHASE_4_SPEC.md §6.2 items 7-8, all tested individually); item 2's eighteen field names now
+ * appear as an annotated list rather than a bare comma-joined one, which satisfies the same
+ * substring requirement while removing the value-shape ambiguity that broke a live dispatch.
+ * Implements PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
  */
 export function buildProtocolInstructions(p: ProtocolInstructionParams): string {
   return [
@@ -66,7 +99,11 @@ export function buildProtocolInstructions(p: ProtocolInstructionParams): string 
     "",
     `When your turn ends (whether complete or not), write a single JSON HandoffRecord document to ` +
       `the exact path "${p.handoffAbsPath}". The record must be a JSON object with exactly these ` +
-      `top-level fields: ${HANDOFF_RECORD_FIELD_NAMES.join(", ")}.`,
+      `eighteen top-level fields, each carrying exactly the value shape stated here:`,
+    ...handoffRecordFieldSpecLines(p.role),
+    "",
+    "These value shapes are validated mechanically and a mismatch refuses the whole turn, so " +
+      "follow them literally rather than substituting a conventional-looking equivalent.",
     "",
     "The repo and spec_ref values you write are advisory only: multi-loopr independently " +
       "recomputes both from its own git and file-hash inspection after your turn ends, and " +

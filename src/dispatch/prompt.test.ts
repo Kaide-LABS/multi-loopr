@@ -3,8 +3,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { FORBIDDEN_RELAY_KEY_PATTERN } from "../domain/relay.ts";
+import { FORBIDDEN_RELAY_KEY_PATTERN, RELAY_SCHEMA_VERSION } from "../domain/relay.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
+import { PROVIDER_IDS } from "../domain/run.ts";
+import { MODEL_TIERS } from "../domain/tiers.ts";
 import {
   buildArtifactProductionInstructions,
   buildExecutorPrompt,
@@ -89,6 +91,57 @@ test("buildProtocolInstructions contains every mandatory-content item, tested in
   assert.ok(out.includes(".claude/loopr/baby_prd.md"));
   // 8. the literal contextRepoRelPath (PHASE_4_SPEC.md §6.2, new)
   assert.ok(out.includes(".claude/loopr/context.md"));
+});
+
+test("buildProtocolInstructions states schema_version's exact value shape: the bare integer, never a version string", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",
+    role: "executor",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+
+  // Regression: a live dispatched turn wrote `"schema_version": "1.0"` -- a plausible semver-style
+  // string -- because the prompt listed the field by name only. The prompt must now state the
+  // required literal, and must name the wrong-but-plausible forms explicitly.
+  assert.equal(RELAY_SCHEMA_VERSION, 1);
+  assert.ok(out.includes(`- schema_version: the bare JSON integer ${String(RELAY_SCHEMA_VERSION)}`));
+  assert.ok(out.includes("no quotes, no decimal point"));
+  assert.ok(out.includes("not a semver string"));
+  assert.ok(out.includes('"1.0"'));
+  assert.ok(out.includes(`the quoted string "${String(RELAY_SCHEMA_VERSION)}" are all rejected outright`));
+});
+
+test("buildProtocolInstructions annotates every HandoffRecord field with a value shape, not just a name", () => {
+  const out = buildProtocolInstructions({
+    handoffAbsPath: "/repo/.multi-loopr/runs/abc/handoff/1/000-executor-claude-code.json",
+    role: "reviewer",
+    specRepoRelPath: "PHASE_2_SPEC.md",
+    babyPrdRepoRelPath: ".claude/loopr/baby_prd.md",
+    contextRepoRelPath: ".claude/loopr/context.md",
+  });
+
+  // Every one of the eighteen fields appears as an annotated bullet with a non-empty description,
+  // never as a bare name in a comma-joined list.
+  for (const field of HANDOFF_RECORD_FIELD_NAMES) {
+    const match = new RegExp(`^- (?:[a-z_]+, )*${field}(?:, [a-z_]+)*: \\S`, "m").exec(out);
+    assert.ok(match !== null, `expected an annotated value-shape line for field "${field}"`);
+  }
+
+  // The enum-valued fields show their literal admissible values, taken from the canonical schemas.
+  for (const provider of PROVIDER_IDS) {
+    assert.ok(out.includes(`"${provider}"`), `expected provider value "${provider}" to be shown`);
+  }
+  for (const tier of MODEL_TIERS) {
+    assert.ok(out.includes(`"${tier}"`), `expected model_tier value "${tier}" to be shown`);
+  }
+  assert.ok(out.includes('- status: exactly one of "completed", "blocked", "halted".'));
+  // The plain-number fields say "bare integer" rather than leaving quoting to guesswork.
+  assert.ok(out.includes("- phase: a bare integer >= 1 (no quotes)."));
+  assert.ok(out.includes("- turn_index: a bare integer >= 0 (no quotes)."));
+  // role is stated concretely for the turn being dispatched.
+  assert.ok(out.includes('For this turn it is "reviewer".'));
 });
 
 test("buildHandoffContext renders only the allow-listed fields, never a raw JSON dump", () => {
