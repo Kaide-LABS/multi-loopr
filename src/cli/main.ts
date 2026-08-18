@@ -274,7 +274,13 @@ export function renderHumanReport(report: DoctorReport): string {
   return lines.join("\n") + "\n";
 }
 
-function renderRunHumanReport(report: RunReport): string {
+/**
+ * Renders a {@link RunReport} as the human-readable `run` output. Exported (mirroring
+ * {@link renderHumanReport}'s own existing precedent) so the "Warnings:" block's rendering --
+ * PHASE_7_SPEC.md §4.3, the human-output half of AC3 -- can be asserted directly against a
+ * synthetic {@link RunReport}, without spawning a real provider turn to trigger it end-to-end.
+ */
+export function renderRunHumanReport(report: RunReport): string {
   const lines: string[] = [];
   lines.push(
     `multi-loopr run -- ${report.ok ? "OK" : "FAILED"} (phase ${String(report.phase)}, generated ${report.generated_at})`,

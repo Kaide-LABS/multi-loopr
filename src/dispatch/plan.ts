@@ -3,6 +3,17 @@
 // Resolves PRD §6.3's DECISION (which archetypes cross-provider-dispatch in V1) into the concrete,
 // ordered, three-slot turn sequence for one run. Plain types, not zod -- in-process only, like
 // `Invocation`/`TurnRequest` (PHASE_1_SPEC.md §3.6).
+//
+// Corroborating literature for `reviewerReviewedOwnWork` (multi-loopr-PRD.md §8.6, MODERNIZATION
+// CHANGELOG 2026-08-18 pass, Phase 7): Panickssery, Bowman, and Feng, "LLM Evaluators Recognize and
+// Favor Their Own Generations," arXiv:2404.13076, 2024-04-15 -- establishes a causal mechanism for
+// self-preference bias when an LLM acts as both evaluator and evaluatee. Chen, Wei, Zhu, Feng, and
+// Meng, "Do LLM Evaluators Prefer Themselves for a Reason?," arXiv:2504.03846, 2025-04-04 --
+// on-point for code generation specifically: "Harmful self-preference persists when evaluator
+// models err as generators, and stronger models display more pronounced harmful self-preference
+// bias when they do err." Together these ground why a `role_pins` configuration that collapses the
+// reviewer onto the diff-writer must be surfaced loudly (`RunResult.warnings`), never proceed
+// silently.
 
 import { InternalError } from "../domain/errors.ts";
 import type { ProviderId, RolePin, RunConfig } from "../domain/run.ts";

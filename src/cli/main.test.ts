@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
 import pkg from "../../package.json" with { type: "json" };
 import { runProcess } from "../util/exec.ts";
 import { DoctorReport } from "./doctor.ts";
-import { renderHumanReport } from "./main.ts";
+import { renderHumanReport, renderRunHumanReport } from "./main.ts";
+import { RunReport } from "./run.ts";
 
 const MAIN_TS_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const RUN_TIMEOUT_MS = 30_000;
@@ -51,6 +52,37 @@ test("--help prints usage to stdout only and exits 0", async () => {
 test("--help's run line names pinned-role behavior (PHASE_7_SPEC.md §4.3, baby_prd.md AC6)", async () => {
   const { stdout } = await runMain(["--help"]);
   assert.match(stdout, /role_pins|pinned/);
+});
+
+function baseRunReport(warnings: readonly string[]): RunReport {
+  return RunReport.parse({
+    schema_version: 1,
+    generated_at: "2026-08-18T00:00:00.000Z",
+    run_id: "11111111-1111-4111-8111-111111111111",
+    phase: 1,
+    ok: true,
+    exit_code: 0,
+    turns: [
+      { turn_index: 0, archetype: "executor", provider: "claude-code", status: "completed", continuity_verdict: null, retried: false },
+      { turn_index: 1, archetype: "executor", provider: "codex-cli", status: "completed", continuity_verdict: "CONTINUED", retried: false },
+      { turn_index: 2, archetype: "reviewer", provider: "codex-cli", status: "completed", continuity_verdict: "CONTINUED", retried: false },
+    ],
+    halt: null,
+    problems: [],
+    warnings,
+  });
+}
+
+test("renderRunHumanReport (PHASE_7_SPEC.md §4.3, AC3) renders a non-empty warnings entry in its own 'Warnings:' block", () => {
+  const withWarning = renderRunHumanReport(
+    baseRunReport(["Turn 2 (reviewer/codex-cli) is reviewing its own prior work: role_pins left no other provider eligible for the reviewer role this run."]),
+  );
+  assert.match(withWarning, /\nWarnings:\n  - Turn 2 \(reviewer\/codex-cli\) is reviewing its own prior work:/);
+});
+
+test("renderRunHumanReport omits the 'Warnings:' block entirely when report.warnings is empty (pre-Phase-7 fixtures unaffected)", () => {
+  const withoutWarning = renderRunHumanReport(baseRunReport([]));
+  assert.doesNotMatch(withoutWarning, /Warnings:/);
 });
 
 test("no arguments at all behaves like --help", async () => {
