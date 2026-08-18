@@ -24,6 +24,14 @@ export const ExitCode = {
   RUN_HALTED: 11,
   LOOPR_ARTIFACT_BYPASSED: 12,
   ACCEPTANCE_INCOMPLETE: 13,
+  /** A completed phase produced neither a next phase spec nor BUILD_COMPLETE.md (PHASE_6_SPEC.md §3.4/§6.5, D4). */
+  DRIVER_HALTED_AMBIGUOUS: 14,
+  /** A completed phase produced both a next phase spec and BUILD_COMPLETE.md (PHASE_6_SPEC.md §3.4/§6.5, D5). */
+  DRIVER_HALTED_INCOHERENT: 15,
+  /** The driver's configured max-phases cap (baby_prd.md acceptance criterion 6) was reached before BUILD_COMPLETE.md (PHASE_6_SPEC.md §3.4/§6.5, D2 nested cap branch). */
+  DRIVER_HALTED_MAX_PHASES: 16,
+  /** BUILD_COMPLETE.md already existed at the target repo root before a driver invocation dispatched anything (PHASE_6_SPEC.md §3.4/§6.1). */
+  DRIVER_START_INCOHERENT: 17,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */

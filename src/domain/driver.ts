@@ -1,0 +1,115 @@
+// Implements PHASE_6_SPEC.md §3.1-§3.6
+//
+// Driver-level schemas and types: `DriveConfig` (one driver invocation's operator-supplied
+// configuration), the six-member `DriverStateId` enumeration and the three-member
+// `DriverDecisionKind` enumeration (the two closed sets baby_prd.md acceptance criteria 1/2 name),
+// and `DriverLogEntry` (one line of the append-only dispatch log, §3.5). Zero I/O, zero provider
+// knowledge -- the same remit `src/domain/run.ts` already has for `RunConfig`.
+//
+// `RepoRelPath`/`IsoUtc` are imported directly from `./relay.ts` here, not redeclared a third time
+// the way `src/domain/run.ts` redeclares `RepoRelPath` locally as `RepoRelPathLike`. `run.ts`'s own
+// file-header comment explains that redeclaration exists solely to avoid a runtime import cycle
+// *between `relay.ts` and `run.ts` themselves* (`relay.ts` already imports `ProviderIdSchema` from
+// `run.ts`, so `run.ts` cannot also import from `relay.ts` without a cycle). `driver.ts` is a new
+// leaf module that neither `relay.ts` nor `run.ts` imports from, so no cycle risk exists here.
+
+import { z } from "zod";
+import { ProviderIdSchema } from "./run.ts";
+import { IsoUtc, RepoRelPath } from "./relay.ts";
+
+/**
+ * Operator-supplied driver configuration. One `DriveConfig` describes one driver invocation, which
+ * may dispatch many `RunConfig`s (one per target-build phase) over its lifetime. Implements
+ * PHASE_6_SPEC.md §3.1.
+ */
+export const DriveConfig = z.strictObject({
+  repo_dir: z.string().min(1),
+  /** Identifies this driver invocation's own dispatch-log directory (§3.5) -- distinct from, and never reused as, any individual phase's `RunConfig.run_id`. */
+  driver_run_id: z.uuid(),
+  /** The target build's own first phase to dispatch. Almost always `1`; not hardcoded, so a driver invocation can resume a target build partway through. */
+  starting_phase: z.number().int().min(1).default(1),
+  /** Repo-relative path to `starting_phase`'s own `PHASE_N_SPEC.md`. */
+  starting_spec_path: RepoRelPath,
+  baby_prd_path: RepoRelPath,
+  context_path: RepoRelPath,
+  /**
+   * The target build's own declared total phase count, from *its own* modernised PRD's phase plan
+   * (the same number a human operator manually re-invoking `multi-loopr run` would already have had
+   * to know to set `RunConfig.is_final_phase` correctly per dispatch -- see PHASE_6_SPEC.md §6.3 for
+   * the full derivation). Required, never inferred: `RunConfig.is_final_phase`'s own doc comment
+   * already establishes "operator-supplied per run -- multi-loopr never infers it" as an existing,
+   * unmodified invariant (`src/domain/run.ts`), and this field is what lets the driver honour that
+   * invariant without asking the operator to set it by hand on every single phase.
+   */
+  target_total_phases: z.number().int().min(1),
+  /** The AC6 cap. Sane default chosen for a target build expected to need low-single-digit-to-low-double-digit phases; generous enough not to trip on a legitimate build, small enough to bound a runaway reviewer. */
+  max_phases: z.number().int().min(1).default(25),
+  executor_providers: z
+    .tuple([ProviderIdSchema, ProviderIdSchema])
+    .refine(([a, b]) => a !== b, "executor_providers must be two different provider ids"),
+  reviewer_provider: ProviderIdSchema.nullable().default(null),
+  turn_timeout_ms: z.number().int().min(1000).max(7_200_000).default(1_800_000),
+  model_overrides: z.partialRecord(ProviderIdSchema, z.string().min(1)).optional(),
+  executor_prompt_path: RepoRelPath.optional(),
+  reviewer_prompt_path: RepoRelPath.optional(),
+});
+
+/** The inferred type of {@link DriveConfig}. */
+export type DriveConfig = z.infer<typeof DriveConfig>;
+
+/**
+ * The closed, enumerated driver state set (baby_prd.md acceptance criterion 1, verbatim). Exactly
+ * six members: no phase run yet (D0); a phase that errored mid-run (D1); phase complete with a new
+ * spec present (D2); phase complete with BUILD_COMPLETE present (D3); phase complete with neither
+ * present (D4); phase complete with both present (D5). Implements PHASE_6_SPEC.md §3.2.
+ */
+export const DRIVER_STATE_IDS = [
+  "D0_NOT_STARTED",
+  "D1_RUN_ERRORED",
+  "D2_NEXT_SPEC_PRESENT",
+  "D3_BUILD_COMPLETE_PRESENT",
+  "D4_NEITHER_PRESENT",
+  "D5_BOTH_PRESENT",
+] as const;
+
+/** A member of {@link DRIVER_STATE_IDS}. */
+export type DriverStateId = (typeof DRIVER_STATE_IDS)[number];
+
+/** zod schema for {@link DriverStateId}. */
+export const DriverStateIdSchema = z.enum(DRIVER_STATE_IDS);
+
+/** The closed, three-member decision-kind set every {@link DriverStateId} resolves to. Implements PHASE_6_SPEC.md §3.3. */
+export const DRIVER_DECISION_KINDS = ["dispatch", "stop", "halt"] as const;
+
+/** A member of {@link DRIVER_DECISION_KINDS}. */
+export type DriverDecisionKind = (typeof DRIVER_DECISION_KINDS)[number];
+
+/** zod schema for {@link DriverDecisionKind}. */
+export const DriverDecisionKindSchema = z.enum(DRIVER_DECISION_KINDS);
+
+/**
+ * One line of the append-only, JSONL dispatch log (PHASE_6_SPEC.md §6.4/§6.7). Implements
+ * PHASE_6_SPEC.md §3.5, baby_prd.md acceptance criterion 7.
+ */
+export const DriverLogEntry = z.strictObject({
+  schema_version: z.literal(1),
+  written_at: IsoUtc,
+  driver_run_id: z.uuid(),
+  /** The target-build phase this decision concerns -- the phase that was just dispatched (for D1-D5) or the phase about to be dispatched for the first time (D0). */
+  phase: z.number().int().min(1),
+  state_id: DriverStateIdSchema,
+  decision_kind: DriverDecisionKindSchema,
+  /** Mandatory, non-empty -- §7 FM-D3 (the direct analogue of loopr's own G3 "silence read as evidence" guard). A `DriverLogEntry` with an empty reason fails validation outright; it is not a legal record. */
+  reason: z.string().min(1),
+  /** The `RunConfig.run_id` this decision's own `runDispatch()` call used, or `null` for the pre-first-dispatch D0/start-incoherence case, which never calls `runDispatch()` at all. */
+  dispatched_run_id: z.uuid().nullable(),
+  /** The `RunResult.exitCode` `runDispatch()` returned for `dispatched_run_id`, or `null` when `dispatched_run_id` is `null`. */
+  dispatched_run_exit_code: z.number().int().nullable(),
+  /** The phase number dispatched next, or `null` for a terminal (`stop`/`halt`) decision. */
+  next_phase: z.number().int().min(1).nullable(),
+  /** The driver's own terminal exit code, or `null` for a non-terminal (`dispatch`) decision. */
+  exit_code: z.number().int().nullable(),
+});
+
+/** The inferred type of {@link DriverLogEntry}. */
+export type DriverLogEntry = z.infer<typeof DriverLogEntry>;

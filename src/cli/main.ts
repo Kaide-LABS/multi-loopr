@@ -15,6 +15,8 @@ import type { RunCommandOptions, RunReport } from "./run.ts";
 import { runRunCommand } from "./run.ts";
 import type { EvidenceCommandOptions, EvidenceReport } from "./evidence.ts";
 import { runEvidenceCommand } from "./evidence.ts";
+import type { DriveCommandOptions, DriveReport } from "./drive.ts";
+import { runDriveCommand } from "./drive.ts";
 
 const USAGE_TEXT = `Usage: multi-loopr <command> [options]
 
@@ -29,6 +31,9 @@ Commands:
   multi-loopr evidence --repo-dir <path> --run-id <uuid> [--final-phase] [--json]
                                               Re-derive AC1/AC2/AC3 evidence for a completed run
                                               from its persisted handoff records.
+  multi-loopr drive --config <path> [--json]  Dispatch a target build's own phases sequentially, one
+                                              runDispatch() call per phase, halting on the first
+                                              ambiguous or incoherent filesystem read.
 `;
 
 type Command =
@@ -36,7 +41,8 @@ type Command =
   | { readonly kind: "help" }
   | ({ readonly kind: "doctor" } & DoctorOptions)
   | ({ readonly kind: "run" } & RunCommandOptions)
-  | ({ readonly kind: "evidence" } & EvidenceCommandOptions);
+  | ({ readonly kind: "evidence" } & EvidenceCommandOptions)
+  | ({ readonly kind: "drive" } & DriveCommandOptions);
 
 function parseDoctorArgs(rest: readonly string[]): Command {
   let json = false;
@@ -143,6 +149,39 @@ function parseEvidenceArgs(rest: readonly string[]): Command {
   return { kind: "evidence", repoDir, runId, finalPhase, json };
 }
 
+/**
+ * Parses `drive`'s flags: `--config <path>` (consumes the next argv element; missing value or
+ * missing flag entirely -> `UsageError`) and `--json`. Any other flag -> `UsageError` -- unknown
+ * flags are never ignored, the same rule every existing CLI surface in this project already
+ * enforces. Does not touch `parseRunArgs`/`parseDoctorArgs`/`parseEvidenceArgs` or their own
+ * argument surfaces. Implements PHASE_6_SPEC.md §4.1.
+ */
+function parseDriveArgs(rest: readonly string[]): Command {
+  let configPath: string | null = null;
+  let json = false;
+
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--config") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        throw new UsageError("drive --config requires a path argument.", { flag: "--config" });
+      }
+      configPath = value;
+      i += 1;
+    } else if (arg === "--json") {
+      json = true;
+    } else {
+      throw new UsageError(`Unknown flag for drive: ${String(arg)}`, { flag: arg });
+    }
+  }
+
+  if (configPath === null) {
+    throw new UsageError("drive requires --config <path>.", { flag: "--config" });
+  }
+  return { kind: "drive", json, configPath };
+}
+
 /** Parses `argv` (the full `process.argv`-shaped array; `argv.slice(2)` is the user's own args). */
 function parseArgs(argv: readonly string[]): Command {
   const args = argv.slice(2);
@@ -166,6 +205,9 @@ function parseArgs(argv: readonly string[]): Command {
   }
   if (first === "evidence") {
     return parseEvidenceArgs(args.slice(1));
+  }
+  if (first === "drive") {
+    return parseDriveArgs(args.slice(1));
   }
 
   throw new UsageError(`Unknown command: ${args.join(" ")}`, { argv: args });
@@ -276,6 +318,32 @@ function renderEvidenceHumanReport(report: EvidenceReport): string {
   return lines.join("\n") + "\n";
 }
 
+/**
+ * Renders a {@link DriveReport} as the human-readable `drive` output: one line per phase
+ * (`phase N [state_id]: decision_kind -- reason`, each a single line) followed by the final
+ * `ok`/`exit_code` summary line -- FM-D5's own "illegible output" guard (PHASE_6_SPEC.md §7, §4.3).
+ */
+function renderDriveHumanReport(report: DriveReport): string {
+  const lines: string[] = [];
+  lines.push(
+    `multi-loopr drive -- ${report.ok ? "OK" : "FAILED"} (driver run ${report.driver_run_id}, generated ${report.generated_at})`,
+  );
+  lines.push("");
+  for (const p of report.phases) {
+    lines.push(`phase ${String(p.phase)} [${p.state_id}]: ${p.decision_kind} -- ${p.reason}`);
+  }
+  if (report.problems.length > 0) {
+    lines.push("");
+    lines.push("Problems:");
+    for (const problem of report.problems) {
+      lines.push(`  - ${problem}`);
+    }
+  }
+  lines.push("");
+  lines.push(`ok: ${String(report.ok)}, exit_code: ${String(report.exit_code)}, final_state: ${report.final_state_id}`);
+  return lines.join("\n") + "\n";
+}
+
 /** Parses `argv`, dispatches the requested command, and returns the process exit code. Never calls `process.exit`. */
 export async function main(argv: readonly string[]): Promise<number> {
   try {
@@ -307,6 +375,11 @@ export async function main(argv: readonly string[]): Promise<number> {
           json: command.json,
         });
         process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderEvidenceHumanReport(report));
+        return exitCode;
+      }
+      case "drive": {
+        const { report, exitCode } = await runDriveCommand({ configPath: command.configPath, json: command.json });
+        process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderDriveHumanReport(report));
         return exitCode;
       }
     }

@@ -86,3 +86,8 @@ export function handoffPath(
   const paddedTurnIndex = String(turnIndex).padStart(3, "0");
   return `${multiLooprDir(repoDir)}/runs/${runId}/handoff/${phase}/${paddedTurnIndex}-${role}-${provider}.json`;
 }
+
+/** The append-only dispatch-log path for one driver invocation (PHASE_6_SPEC.md §3.5/§3.6, AC7). Mirrors {@link handoffPath}'s own `.multi-loopr/runs/<id>/...` convention, one directory level up from any individual phase's handoff records (which live under a phase-specific `RunConfig.run_id`, never `driver_run_id`). */
+export function driverLogPath(repoDir: string, driverRunId: string): string {
+  return `${multiLooprDir(repoDir)}/runs/${driverRunId}/driver-log.jsonl`;
+}
