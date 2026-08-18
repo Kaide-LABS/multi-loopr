@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FORBIDDEN_RELAY_KEY_PATTERN, RELAY_SCHEMA_VERSION } from "../domain/relay.ts";
 import type { HandoffRecord } from "../domain/relay.ts";
+import { getRole } from "../domain/roles.ts";
 import { PROVIDER_IDS } from "../domain/run.ts";
 import { MODEL_TIERS } from "../domain/tiers.ts";
 import {
@@ -13,6 +14,7 @@ import {
   buildHandoffContext,
   buildProtocolInstructions,
   buildReviewerPrompt,
+  sanitizeProjectRolePrompt,
 } from "./prompt.ts";
 
 const HANDOFF_RECORD_FIELD_NAMES = [
@@ -534,6 +536,136 @@ test("buildReviewerPrompt's output contains the literal expectedArtifactPath and
   });
   assert.ok(final.includes("BUILD_COMPLETE.md"));
   assert.ok(final.includes("completion record"));
+});
+
+// -------------------------------------------------------------------------------------------
+// sanitizeProjectRolePrompt() and its roleTaskInstructions wiring into buildExecutorPrompt()/
+// buildReviewerPrompt() -- dispatching a target build's own customized loopr Step 11/12 prompt
+// (RunConfig.executor_prompt_path/reviewer_prompt_path) across either provider.
+// -------------------------------------------------------------------------------------------
+
+const LOOPR_STEP11_FIXTURE = [
+  "---",
+  "name: loopr-step11",
+  "description: Runs this project's customized step11 prompt.",
+  "model: sonnet",
+  "effort: low",
+  "---",
+  "",
+  "STEP 11 PROMPT",
+  "# STEP 11 -- PHASE BUILD EXECUTION -- some-project",
+  "",
+  "Run in Claude Code. Working directory: some-project root.",
+  "",
+  "## ROLE",
+  "Act as the Lead Execution Engineer for some-project.",
+].join("\n");
+
+test("sanitizeProjectRolePrompt strips a leading YAML frontmatter block and preserves the body verbatim", () => {
+  const out = sanitizeProjectRolePrompt(LOOPR_STEP11_FIXTURE);
+  assert.ok(!out.includes("name: loopr-step11"));
+  assert.ok(!out.includes("model: sonnet"));
+  assert.ok(!out.includes("effort: low"));
+  assert.ok(out.includes("# STEP 11 -- PHASE BUILD EXECUTION -- some-project"));
+  assert.ok(out.includes("Act as the Lead Execution Engineer for some-project."));
+});
+
+test("sanitizeProjectRolePrompt neutralizes single-provider environment phrasing with a notice, rather than editing the body", () => {
+  const out = sanitizeProjectRolePrompt(LOOPR_STEP11_FIXTURE);
+  // The body's own "Run in Claude Code" line is left completely intact -- the fix is a notice
+  // ahead of it, not surgery on the customized content itself.
+  assert.ok(out.includes("Run in Claude Code. Working directory: some-project root."));
+  assert.ok(out.includes("not a constraint on this dispatch"));
+  assert.ok(out.includes("multi-loopr's own protocol instructions"));
+  // The notice appears before the body, so it frames the reader's expectations up front.
+  const noticeIndex = out.indexOf("not a constraint on this dispatch");
+  const bodyIndex = out.indexOf("# STEP 11 -- PHASE BUILD EXECUTION");
+  assert.ok(noticeIndex >= 0 && bodyIndex >= 0 && noticeIndex < bodyIndex);
+});
+
+test("sanitizeProjectRolePrompt leaves content with no frontmatter block untouched aside from the prepended notice", () => {
+  const noFrontmatter = "## ROLE\nAct as reviewer.";
+  const out = sanitizeProjectRolePrompt(noFrontmatter);
+  assert.ok(out.includes("## ROLE\nAct as reviewer."));
+  assert.ok(out.includes("not a constraint on this dispatch"));
+});
+
+test("buildExecutorPrompt places roleTaskInstructions after the role profile and before the protocol instructions, and omits it entirely when absent", () => {
+  const withInstructions = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: null,
+    retryNote: null,
+    roleTaskInstructions: "CUSTOM STEP 11 METHODOLOGY MARKER",
+  });
+  assert.ok(withInstructions.includes("CUSTOM STEP 11 METHODOLOGY MARKER"));
+  const profileIndex = withInstructions.indexOf(getRole("executor").profileSummary);
+  const instructionsIndex = withInstructions.indexOf("CUSTOM STEP 11 METHODOLOGY MARKER");
+  const protocolIndex = withInstructions.indexOf("You are participating in a multi-loopr dispatched");
+  assert.ok(profileIndex >= 0 && instructionsIndex >= 0 && protocolIndex >= 0);
+  assert.ok(profileIndex < instructionsIndex);
+  assert.ok(instructionsIndex < protocolIndex);
+
+  const withoutField = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: null,
+    retryNote: null,
+  });
+  assert.ok(!withoutField.includes("CUSTOM STEP 11 METHODOLOGY MARKER"));
+
+  const withNull = buildExecutorPrompt({
+    role: "executor",
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: null,
+    retryNote: null,
+    roleTaskInstructions: null,
+  });
+  assert.equal(withNull, withoutField);
+});
+
+test("buildReviewerPrompt places roleTaskInstructions after the role profile and before the protocol instructions, and omits it entirely when absent", () => {
+  const withInstructions = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
+    retryNote: null,
+    roleTaskInstructions: "CUSTOM STEP 12 METHODOLOGY MARKER",
+  });
+  assert.ok(withInstructions.includes("CUSTOM STEP 12 METHODOLOGY MARKER"));
+  const profileIndex = withInstructions.indexOf(getRole("reviewer").profileSummary);
+  const instructionsIndex = withInstructions.indexOf("CUSTOM STEP 12 METHODOLOGY MARKER");
+  const protocolIndex = withInstructions.indexOf("You are participating in a multi-loopr dispatched");
+  assert.ok(profileIndex >= 0 && instructionsIndex >= 0 && protocolIndex >= 0);
+  assert.ok(profileIndex < instructionsIndex);
+  assert.ok(instructionsIndex < protocolIndex);
+
+  const withoutField = buildReviewerPrompt({
+    specRepoRelPath: "PHASE_1_SPEC.md",
+    handoffAbsPath: "/repo/handoff.json",
+    babyPrdRepoRelPath: BABY_PRD_REPO_REL_PATH,
+    contextRepoRelPath: CONTEXT_REPO_REL_PATH,
+    priorRecord: priorRecord(),
+    diff: "diff",
+    expectedArtifactPath: "PHASE_2_SPEC.md",
+    isFinalPhase: false,
+    retryNote: null,
+  });
+  assert.ok(!withoutField.includes("CUSTOM STEP 12 METHODOLOGY MARKER"));
 });
 
 test("buildExecutorPrompt's output never contains buildArtifactProductionInstructions()'s output -- production instructions are reviewer-only", () => {

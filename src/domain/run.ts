@@ -103,6 +103,20 @@ export const RunConfig = z.strictObject({
    * `turn_timeout_ms`'s own default already established.
    */
   is_final_phase: z.boolean().default(false),
+  /**
+   * Repo-relative path to this build's own customized loopr Step 11 (execution) prompt -- the
+   * output of `loopr customize --step 11` for the project `spec_path` belongs to. Optional: when
+   * omitted, an executor turn receives only the executor role's generic `profileSummary` plus
+   * multi-loopr's own protocol instructions, exactly as every run before this field existed. When
+   * present, its content is read once by multi-loopr itself and layered into every executor
+   * turn's prompt ahead of the protocol instructions, carrying loopr's real per-project discipline
+   * (autonomous critique, its MAY/MAY-NOT invariant list, phase discovery) across whichever
+   * provider actually executes the turn -- never welding that discipline to a concrete provider or
+   * spawn mechanism (PRD §6.1 portability constraint).
+   */
+  executor_prompt_path: RepoRelPathLike.optional(),
+  /** Same treatment as {@link RunConfig.executor_prompt_path}, for loopr's Step 12 (adversarial review + phase advancement) prompt. */
+  reviewer_prompt_path: RepoRelPathLike.optional(),
 });
 
 /** The inferred type of {@link RunConfig}. */

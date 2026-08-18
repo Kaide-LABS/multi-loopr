@@ -30,13 +30,14 @@ import { verifyContinuation } from "../verify/continuity.ts";
 import { diffText, resetHard } from "../verify/git.ts";
 import { runPreflight } from "../verify/preflight.ts";
 import { acquireRunLock, releaseRunLock } from "../util/lock.ts";
+import { readFile } from "node:fs/promises";
 import { handoffPath, repoRelToAbs } from "../util/paths.ts";
 import { sha256File } from "../util/hash.ts";
 import { runProcess } from "../util/exec.ts";
 import { nextPhaseSpecPath } from "./artifacts.ts";
 import type { TurnPlan } from "./plan.ts";
 import { planTurnSequence } from "./plan.ts";
-import { buildExecutorPrompt, buildReviewerPrompt } from "./prompt.ts";
+import { buildExecutorPrompt, buildReviewerPrompt, sanitizeProjectRolePrompt } from "./prompt.ts";
 import type { RunTurnDeps } from "./turn.ts";
 import { runTurn } from "./turn.ts";
 
@@ -131,6 +132,12 @@ interface BuildPromptInput {
   /** `RunConfig.is_final_phase`; unused for an executor slot (PHASE_4_SPEC.md §6.4, new). */
   readonly isFinalPhase: boolean;
   readonly retryNote: string | null;
+  /**
+   * This build's own customized loopr Step 11/12 prompt content for `slot.archetype`, already
+   * sanitized via `sanitizeProjectRolePrompt` -- or `null` when the corresponding `RunConfig`
+   * path (`executor_prompt_path`/`reviewer_prompt_path`) was not supplied for this run.
+   */
+  readonly roleTaskInstructions: string | null;
 }
 
 function buildPromptForSlot(input: BuildPromptInput): string {
@@ -143,6 +150,7 @@ function buildPromptForSlot(input: BuildPromptInput): string {
       contextRepoRelPath: input.contextRepoRelPath,
       priorRecord: input.prevRecord,
       retryNote: input.retryNote,
+      roleTaskInstructions: input.roleTaskInstructions,
     });
   }
   // The reviewer slot always has a non-null prevRecord and diff -- it is never the first slot in
@@ -157,6 +165,7 @@ function buildPromptForSlot(input: BuildPromptInput): string {
     expectedArtifactPath: input.nextArtifactPath,
     isFinalPhase: input.isFinalPhase,
     retryNote: input.retryNote,
+    roleTaskInstructions: input.roleTaskInstructions,
   });
 }
 
@@ -171,6 +180,12 @@ interface DispatchOneAttemptInput {
   /** The reviewer's expected next-artifact path, computed once per run (PHASE_4_SPEC.md §6.4, new). */
   readonly nextArtifactPath: string;
   readonly retryNote: string | null;
+  /**
+   * This build's own customized loopr Step 11/12 prompt content, sanitized and selected for
+   * `slot.archetype` by the caller (`runTurnLoop` reads and sanitizes both paths at most once per
+   * run, not once per attempt) -- or `null` when the run carries no such customization.
+   */
+  readonly roleTaskInstructions: string | null;
 }
 
 async function dispatchOneAttempt(input: DispatchOneAttemptInput) {
@@ -189,6 +204,7 @@ async function dispatchOneAttempt(input: DispatchOneAttemptInput) {
     nextArtifactPath: input.nextArtifactPath,
     isFinalPhase: config.is_final_phase,
     retryNote: input.retryNote,
+    roleTaskInstructions: input.roleTaskInstructions,
   });
   const req: TurnRequest = {
     runId: config.run_id,
@@ -223,9 +239,11 @@ function nonCompleteSummary(
 /**
  * [DET] The extended preflight check (§6.5 step 1; PHASE_4_SPEC.md §6.4 extends it with two more
  * checks of the identical shape): the ordinary `runPreflight()` (Phase 1, unchanged) plus
- * readability checks on `config.spec_path`, `config.baby_prd_path`, and `config.context_path`, all
- * folded into the same "is everything this run needs actually present and healthy" concept rather
- * than a new exit code.
+ * readability checks on `config.spec_path`, `config.baby_prd_path`, and `config.context_path`,
+ * plus the same check on `config.executor_prompt_path`/`config.reviewer_prompt_path` whenever
+ * either is supplied (both optional -- unset means "no check", not "must be absent"), all folded
+ * into the same "is everything this run needs actually present and healthy" concept rather than a
+ * new exit code.
  */
 async function runExtendedPreflight(
   config: RunConfig,
@@ -235,11 +253,17 @@ async function runExtendedPreflight(
   const problems: string[] = [...summary.problems];
   let ok = summary.ok;
 
-  const readabilityChecks: readonly [string, string][] = [
+  const readabilityChecks: [string, string][] = [
     ["spec_path", config.spec_path],
     ["baby_prd_path", config.baby_prd_path],
     ["context_path", config.context_path],
   ];
+  if (config.executor_prompt_path !== undefined) {
+    readabilityChecks.push(["executor_prompt_path", config.executor_prompt_path]);
+  }
+  if (config.reviewer_prompt_path !== undefined) {
+    readabilityChecks.push(["reviewer_prompt_path", config.reviewer_prompt_path]);
+  }
   for (const [label, path] of readabilityChecks) {
     try {
       await sha256File(repoRelToAbs(config.repo_dir, path));
@@ -281,6 +305,27 @@ export async function runDispatch(config: RunConfig, deps?: RunDispatchDeps): Pr
   }
 }
 
+/**
+ * Reads and sanitizes `config.executor_prompt_path`/`config.reviewer_prompt_path` (this build's
+ * own customized loopr Step 11/12 prompts) at most once per run -- never once per attempt, since
+ * neither file changes across a run's turns or a continuity retry. `null` for either path that was
+ * not supplied for this run, mirroring `RunConfig`'s own optional treatment of the two fields.
+ */
+async function readRoleTaskInstructions(config: RunConfig): Promise<{ executor: string | null; reviewer: string | null }> {
+  async function readAndSanitize(repoRelPath: string | undefined): Promise<string | null> {
+    if (repoRelPath === undefined) {
+      return null;
+    }
+    const raw = await readFile(repoRelToAbs(config.repo_dir, repoRelPath), "utf8");
+    return sanitizeProjectRolePrompt(raw);
+  }
+  const [executor, reviewer] = await Promise.all([
+    readAndSanitize(config.executor_prompt_path),
+    readAndSanitize(config.reviewer_prompt_path),
+  ]);
+  return { executor, reviewer };
+}
+
 async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<RunResult> {
   const adapters = deps?.adapters ?? ADAPTER_REGISTRY;
   const runProcessFn = deps?.runProcessFn;
@@ -288,6 +333,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
   const specSha256 = await sha256File(repoRelToAbs(config.repo_dir, config.spec_path));
   const specRef: FileRef = { path: config.spec_path, sha256: specSha256 };
   const nextArtifactPath = nextPhaseSpecPath(config.spec_path, config.phase, config.is_final_phase);
+  const roleTaskInstructions = await readRoleTaskInstructions(config);
 
   const plan = planTurnSequence(config);
   const turns: TurnAttemptSummary[] = [];
@@ -315,6 +361,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
       diff,
       nextArtifactPath,
       retryNote: null,
+      roleTaskInstructions: slot.archetype === "executor" ? roleTaskInstructions.executor : roleTaskInstructions.reviewer,
     });
 
     if (!result.outcome.ok) {
@@ -426,6 +473,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
       diff,
       nextArtifactPath,
       retryNote: buildRetryNote(verdict),
+      roleTaskInstructions: slot.archetype === "executor" ? roleTaskInstructions.executor : roleTaskInstructions.reviewer,
     });
 
     if (!retryResult.outcome.ok) {

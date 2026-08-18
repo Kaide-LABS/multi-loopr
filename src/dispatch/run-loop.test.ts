@@ -775,6 +775,145 @@ test("runDispatch: a missing context_path fails preflight (exitCode 3) before ac
   }
 });
 
+test("runDispatch: a missing executor_prompt_path fails preflight (exitCode 3) before acquiring the lock or dispatching any turn", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { executor_prompt_path: "DOES_NOT_EXIST_STEP11.md" });
+    const adapters: AdapterRegistry = {
+      "claude-code": new RecordingFakeAdapter("claude-code"),
+      "codex-cli": new RecordingFakeAdapter("codex-cli"),
+    };
+
+    let calls = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      calls += 1;
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 3);
+    assert.deepStrictEqual(result.turns, []);
+    assert.equal(calls, 0);
+    assert.equal(await readRunLock(dir), null);
+    assert.ok(result.problems.some((p) => p.includes("DOES_NOT_EXIST_STEP11.md")));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: a missing reviewer_prompt_path fails preflight (exitCode 3) before acquiring the lock or dispatching any turn; reviewer_prompt_path alone is checked without requiring executor_prompt_path", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { reviewer_prompt_path: "DOES_NOT_EXIST_STEP12.md" });
+    const adapters: AdapterRegistry = {
+      "claude-code": new RecordingFakeAdapter("claude-code"),
+      "codex-cli": new RecordingFakeAdapter("codex-cli"),
+    };
+
+    let calls = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      calls += 1;
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 3);
+    assert.deepStrictEqual(result.turns, []);
+    assert.equal(calls, 0);
+    assert.equal(await readRunLock(dir), null);
+    assert.ok(result.problems.some((p) => p.includes("DOES_NOT_EXIST_STEP12.md")));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: executor_prompt_path/reviewer_prompt_path content, sanitized, reaches the actual executor/reviewer turns' prompts -- and only those turns", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    await commitFile(
+      dir,
+      "STEP11.md",
+      ["---", "name: loopr-step11", "model: sonnet", "---", "", "STEP11 REAL METHODOLOGY MARKER"].join("\n"),
+      "add STEP11.md",
+    );
+    await commitFile(
+      dir,
+      "STEP12.md",
+      ["---", "name: loopr-step12", "model: sonnet", "---", "", "STEP12 REAL METHODOLOGY MARKER"].join("\n"),
+      "add STEP12.md",
+    );
+    const config = baseConfig(dir, { executor_prompt_path: "STEP11.md", reviewer_prompt_path: "STEP12.md" });
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "claude-code"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+    assert.equal(result.ok, true);
+
+    // Both executor turns (claude-code turn 0, codex-cli turn 1) receive the sanitized Step 11
+    // content, frontmatter stripped -- proving the content reaches whichever provider actually
+    // executes the slot, not just the provider the file happens to be customized "for".
+    assert.ok(claude.seenRequests[0]?.prompt.includes("STEP11 REAL METHODOLOGY MARKER"));
+    assert.ok(codex.seenRequests[0]?.prompt.includes("STEP11 REAL METHODOLOGY MARKER"));
+    for (const req of [claude.seenRequests[0], codex.seenRequests[0]]) {
+      assert.ok(!req?.prompt.includes("name: loopr-step11"));
+    }
+
+    // The reviewer turn (claude-code turn 2) receives Step 12 content, never Step 11's.
+    assert.ok(claude.seenRequests[1]?.prompt.includes("STEP12 REAL METHODOLOGY MARKER"));
+    assert.ok(!claude.seenRequests[1]?.prompt.includes("STEP11 REAL METHODOLOGY MARKER"));
+    assert.ok(!claude.seenRequests[1]?.prompt.includes("name: loopr-step12"));
+
+    // And Step 12 content never leaks into an executor turn's prompt.
+    assert.ok(!claude.seenRequests[0]?.prompt.includes("STEP12 REAL METHODOLOGY MARKER"));
+    assert.ok(!codex.seenRequests[0]?.prompt.includes("STEP12 REAL METHODOLOGY MARKER"));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
 test("runDispatch: is_final_phase: true computes and enforces BUILD_COMPLETE.md as the reviewer's expected artifact path, instead of a PHASE_N_SPEC.md pattern", async () => {
   const dir = await freshRepoWithSpec();
   try {

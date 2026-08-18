@@ -62,6 +62,45 @@ function handoffRecordFieldSpecLines(role: "executor" | "reviewer"): readonly st
 /** A very large diff would make an invocation's `stdin` payload unboundedly large; capped here. */
 const DIFF_CAP_CHARS = 20_000;
 
+/**
+ * Matches a leading YAML frontmatter block (`---\n...\n---\n`), the Claude Code subagent metadata
+ * (`name`/`description`/`model`/`effort`) that `loopr customize --step 11/12` writes at the top of
+ * its output file. That block is spawn-mechanism metadata for a single provider's subagent
+ * dispatch, not part of the role's actual task content, so it is never appropriate to hand a
+ * provider as part of its prompt text.
+ */
+const YAML_FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---\r?\n/;
+
+/**
+ * Prepares a target build's own customized loopr Step 11/12 prompt file (read verbatim by the
+ * caller, e.g. from `RunConfig.executor_prompt_path`/`reviewer_prompt_path`) for inclusion in a
+ * dispatched turn's prompt, regardless of which provider executes that turn.
+ *
+ * Strips a leading YAML frontmatter block if present (see {@link YAML_FRONTMATTER_RE}) and
+ * prepends a short notice neutralizing any single-provider environment phrasing the body still
+ * carries -- these files are customized once per project and routinely say things like "Run in
+ * Claude Code" (see e.g. `.claude/agents/loopr-step11.md`), because they were originally authored
+ * for a Claude-Code-only subagent dispatch. That phrasing does not describe a constraint on this
+ * dispatch: multi-loopr may run this exact turn under either provider, and its own protocol
+ * instructions (built separately by {@link buildProtocolInstructions} and always placed after this
+ * content) are what actually govern the handoff record, the commit requirement, and isolation --
+ * regardless of anything this file's body says about environment or process.
+ */
+export function sanitizeProjectRolePrompt(raw: string): string {
+  const body = raw.replace(YAML_FRONTMATTER_RE, "").trim();
+  return [
+    "The following is this project's own loopr methodology for this role, exactly as customized " +
+      "for this build. It may reference running in a specific tool (e.g. \"Run in Claude Code\") or " +
+      "name a specific provider -- that reflects how it was originally authored for a single " +
+      "provider's subagent dispatch, not a constraint on this dispatch: this turn may be executed " +
+      "by a different provider than the one named below, and multi-loopr's own protocol " +
+      "instructions that follow this section (handoff record, commit requirement, isolation) are " +
+      "authoritative regardless of which provider you are.",
+    "",
+    body,
+  ].join("\n");
+}
+
 /** Parameters for {@link buildProtocolInstructions}. */
 export interface ProtocolInstructionParams {
   readonly handoffAbsPath: string;
@@ -283,10 +322,19 @@ export interface BuildExecutorPromptParams {
   readonly contextRepoRelPath: string;
   readonly priorRecord: HandoffRecord | null;
   readonly retryNote: string | null;
+  /**
+   * This build's own customized loopr Step 11 prompt content, already sanitized via
+   * {@link sanitizeProjectRolePrompt} by the caller -- or `null`/omitted when
+   * `RunConfig.executor_prompt_path` was not supplied for this run. Optional (rather than a
+   * required `string | null`, unlike `priorRecord`/`retryNote`) so every pre-existing call site
+   * that has no reason to know about this capability keeps parsing unchanged.
+   */
+  readonly roleTaskInstructions?: string | null;
 }
 
 /**
- * Concatenates: `getRole("executor").profileSummary` + {@link buildProtocolInstructions} (now
+ * Concatenates: `getRole("executor").profileSummary` + (`roleTaskInstructions`, when supplied --
+ * this build's own customized loopr Step 11 methodology) + {@link buildProtocolInstructions} (now
  * including the baby_prd/context mandatory-content items) +
  * (`priorRecord === null` ? nothing : {@link buildHandoffContext}, for the second executor turn) +
  * (`retryNote` when non-null). No production-instruction block is ever added for an executor turn
@@ -294,8 +342,11 @@ export interface BuildExecutorPromptParams {
  * PHASE_4_SPEC.md §6.2.
  */
 export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
-  const parts: string[] = [
-    getRole("executor").profileSummary,
+  const parts: string[] = [getRole("executor").profileSummary];
+  if (params.roleTaskInstructions !== null && params.roleTaskInstructions !== undefined) {
+    parts.push(params.roleTaskInstructions);
+  }
+  parts.push(
     buildProtocolInstructions({
       handoffAbsPath: params.handoffAbsPath,
       role: "executor",
@@ -303,7 +354,7 @@ export function buildExecutorPrompt(params: BuildExecutorPromptParams): string {
       babyPrdRepoRelPath: params.babyPrdRepoRelPath,
       contextRepoRelPath: params.contextRepoRelPath,
     }),
-  ];
+  );
   if (params.priorRecord !== null) {
     parts.push(buildHandoffContext(params.priorRecord));
   }
@@ -361,10 +412,19 @@ export interface BuildReviewerPromptParams {
   /** Whether this run's reviewer turn is the target build's own final phase (PHASE_4_SPEC.md §1.4, new). */
   readonly isFinalPhase: boolean;
   readonly retryNote: string | null;
+  /**
+   * This build's own customized loopr Step 12 prompt content, already sanitized via
+   * {@link sanitizeProjectRolePrompt} by the caller -- or `null`/omitted when
+   * `RunConfig.reviewer_prompt_path` was not supplied for this run. Same optional-rather-than-
+   * required treatment as {@link BuildExecutorPromptParams.roleTaskInstructions}, for the same
+   * pre-existing-call-site reason.
+   */
+  readonly roleTaskInstructions?: string | null;
 }
 
 /**
- * Concatenates: `getRole("reviewer").profileSummary` + {@link buildProtocolInstructions} (now
+ * Concatenates: `getRole("reviewer").profileSummary` + (`roleTaskInstructions`, when supplied --
+ * this build's own customized loopr Step 12 methodology) + {@link buildProtocolInstructions} (now
  * including the baby_prd/context mandatory-content items) +
  * {@link buildArtifactProductionInstructions} (Phase 4, new -- placed immediately after the
  * protocol instructions and before the handoff/diff context, matching the existing convention that
@@ -375,8 +435,11 @@ export interface BuildReviewerPromptParams {
  * PHASE_3_SPEC.md §6.2, PHASE_4_SPEC.md §6.2.
  */
 export function buildReviewerPrompt(params: BuildReviewerPromptParams): string {
-  const parts: string[] = [
-    getRole("reviewer").profileSummary,
+  const parts: string[] = [getRole("reviewer").profileSummary];
+  if (params.roleTaskInstructions !== null && params.roleTaskInstructions !== undefined) {
+    parts.push(params.roleTaskInstructions);
+  }
+  parts.push(
     buildProtocolInstructions({
       handoffAbsPath: params.handoffAbsPath,
       role: "reviewer",
@@ -387,7 +450,7 @@ export function buildReviewerPrompt(params: BuildReviewerPromptParams): string {
     buildArtifactProductionInstructions(params.expectedArtifactPath, params.isFinalPhase),
     buildHandoffContext(params.priorRecord),
     `Diff under review (${params.specRepoRelPath}'s executor turns):\n${truncateDiff(params.diff)}`,
-  ];
+  );
   if (params.retryNote !== null) {
     parts.push(params.retryNote);
   }

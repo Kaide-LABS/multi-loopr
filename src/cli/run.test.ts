@@ -309,6 +309,42 @@ test("RunConfig rejects an absolute context_path and a context_path containing a
   assert.equal(RunConfig.safeParse({ ...base, context_path: "context.md" }).success, true);
 });
 
+test("RunConfig.executor_prompt_path/reviewer_prompt_path are optional, path-safe, and independent of each other", () => {
+  const base = {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+  };
+
+  // Both entirely absent -- every run before this pair of fields existed keeps parsing.
+  const omitted = RunConfig.safeParse(base);
+  assert.equal(omitted.success, true);
+  assert.equal(omitted.success ? omitted.data.executor_prompt_path : undefined, undefined);
+  assert.equal(omitted.success ? omitted.data.reviewer_prompt_path : undefined, undefined);
+
+  // Either may be supplied without the other -- they are independent, not a linked pair.
+  const executorOnly = RunConfig.safeParse({ ...base, executor_prompt_path: ".claude/agents/loopr-step11.md" });
+  assert.equal(executorOnly.success, true);
+  assert.equal(executorOnly.success ? executorOnly.data.executor_prompt_path : undefined, ".claude/agents/loopr-step11.md");
+  assert.equal(executorOnly.success ? executorOnly.data.reviewer_prompt_path : undefined, undefined);
+
+  const reviewerOnly = RunConfig.safeParse({ ...base, reviewer_prompt_path: ".claude/agents/loopr-step12.md" });
+  assert.equal(reviewerOnly.success, true);
+  assert.equal(reviewerOnly.success ? reviewerOnly.data.reviewer_prompt_path : undefined, ".claude/agents/loopr-step12.md");
+
+  // Same repo-relative-path-safety rule as spec_path/baby_prd_path/context_path -- one shared
+  // schema value (RepoRelPathLike), so no separate traversal/absolute-path check is needed per
+  // field, but each is verified here to confirm it is actually wired to that shared schema.
+  assert.equal(RunConfig.safeParse({ ...base, executor_prompt_path: "/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, executor_prompt_path: "../outside.md" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, reviewer_prompt_path: "/etc/passwd" }).success, false);
+  assert.equal(RunConfig.safeParse({ ...base, reviewer_prompt_path: "../outside.md" }).success, false);
+});
+
 test("RunConfig.is_final_phase defaults to false when omitted, and accepts an explicit true", () => {
   const base = {
     run_id: RUN_ID,
