@@ -212,3 +212,23 @@ test("doctor (no flags) runs the full report and exits per §4.3 precedence", as
   // clean, so the only candidate exit code is 3.
   assert.equal(exitCode, 3);
 });
+
+// PHASE_8_SPEC.md §1.2 -- `mcp` subcommand parsing and usage-text additions.
+
+test("mcp is parsed with zero flags and exits 0 cleanly on stdin EOF", async () => {
+  const { exitCode, stdout, stderr } = await runMain(["mcp"]);
+  assert.equal(exitCode, 0);
+  assert.equal(stdout, "");
+  assert.equal(stderr, "");
+});
+
+test("any flag passed to mcp is a usage error (exit 2)", async () => {
+  const { exitCode, stderr } = await runMain(["mcp", "--not-a-real-flag"]);
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /Unknown flag for mcp/);
+});
+
+test("USAGE_TEXT contains a multi-loopr mcp line", async () => {
+  const { stdout } = await runMain(["--help"]);
+  assert.match(stdout, /multi-loopr mcp\s+Start a local, stdio-only Model Context Protocol server/);
+});

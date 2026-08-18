@@ -20,6 +20,15 @@ export interface BoundaryViolation {
 /** The one file excluded by name (it contains every forbidden pattern by construction). */
 const EXCLUDED_EXACT_REPO_REL_PATH = "src/verify/boundary-rules.ts";
 
+/**
+ * B2's closed runtime-dependency allowlist. `zod` was the only member through Phase 7;
+ * `@modelcontextprotocol/sdk` is the operator's own explicitly confirmed, one-time exception added
+ * for the MCP server feature (Phase 8, PRD §5.1). Declared once, by name, so the allowlist is
+ * legible as a single, named, greppable fact rather than inline in the conditional below --
+ * PHASE_8_SPEC.md §1.3, §7 FM-M3.
+ */
+const ALLOWED_DEPENDENCY_KEYS = ["zod", "@modelcontextprotocol/sdk"] as const;
+
 async function listTsFilesRecursive(dir: string): Promise<readonly string[]> {
   let entries;
   try {
@@ -140,7 +149,7 @@ async function scanManifest(repoRoot: string): Promise<readonly BoundaryViolatio
   }
   const violations: BoundaryViolation[] = [];
   for (const key of Object.keys(deps as Record<string, unknown>)) {
-    if (key !== "zod") {
+    if (!ALLOWED_DEPENDENCY_KEYS.includes(key as (typeof ALLOWED_DEPENDENCY_KEYS)[number])) {
       violations.push({ rule: "B2", file: "package.json", line: 1, excerpt: key });
     }
   }

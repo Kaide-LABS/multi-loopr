@@ -17,6 +17,7 @@ import type { EvidenceCommandOptions, EvidenceReport } from "./evidence.ts";
 import { runEvidenceCommand } from "./evidence.ts";
 import type { DriveCommandOptions, DriveReport } from "./drive.ts";
 import { runDriveCommand } from "./drive.ts";
+import { runMcpServer } from "../mcp/server.ts";
 
 const USAGE_TEXT = `Usage: multi-loopr <command> [options]
 
@@ -35,6 +36,8 @@ Commands:
   multi-loopr drive --config <path> [--json]  Dispatch a target build's own phases sequentially, one
                                               runDispatch() call per phase, halting on the first
                                               ambiguous or incoherent filesystem read.
+  multi-loopr mcp                             Start a local, stdio-only Model Context Protocol server
+                                              exposing run/drive/doctor/evidence as MCP tools.
 `;
 
 type Command =
@@ -43,7 +46,8 @@ type Command =
   | ({ readonly kind: "doctor" } & DoctorOptions)
   | ({ readonly kind: "run" } & RunCommandOptions)
   | ({ readonly kind: "evidence" } & EvidenceCommandOptions)
-  | ({ readonly kind: "drive" } & DriveCommandOptions);
+  | ({ readonly kind: "drive" } & DriveCommandOptions)
+  | { readonly kind: "mcp" };
 
 function parseDoctorArgs(rest: readonly string[]): Command {
   let json = false;
@@ -183,6 +187,18 @@ function parseDriveArgs(rest: readonly string[]): Command {
   return { kind: "drive", json, configPath };
 }
 
+/**
+ * Parses `mcp`'s flags: none. Any element in `rest` is a `UsageError` -- mirrors every other
+ * `parse*Args` function's own "unknown flags are never ignored" discipline (PHASE_1_SPEC.md §4.1);
+ * `mcp` simply takes none (PHASE_8_SPEC.md §4.1, §9 non-goal 7).
+ */
+function parseMcpArgs(rest: readonly string[]): Command {
+  if (rest.length > 0) {
+    throw new UsageError(`Unknown flag for mcp: ${String(rest[0])}`, { flag: rest[0] });
+  }
+  return { kind: "mcp" };
+}
+
 /** Parses `argv` (the full `process.argv`-shaped array; `argv.slice(2)` is the user's own args). */
 function parseArgs(argv: readonly string[]): Command {
   const args = argv.slice(2);
@@ -209,6 +225,9 @@ function parseArgs(argv: readonly string[]): Command {
   }
   if (first === "drive") {
     return parseDriveArgs(args.slice(1));
+  }
+  if (first === "mcp") {
+    return parseMcpArgs(args.slice(1));
   }
 
   throw new UsageError(`Unknown command: ${args.join(" ")}`, { argv: args });
@@ -395,6 +414,10 @@ export async function main(argv: readonly string[]): Promise<number> {
         const { report, exitCode } = await runDriveCommand({ configPath: command.configPath, json: command.json });
         process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderDriveHumanReport(report));
         return exitCode;
+      }
+      case "mcp": {
+        await runMcpServer();
+        return ExitCode.OK;
       }
     }
     // Exhaustive per the Command union above; unreachable, but satisfies noImplicitReturns.

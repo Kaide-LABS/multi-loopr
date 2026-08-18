@@ -19,6 +19,12 @@ output rather than silently proceeding.
 `multi-loopr evidence --repo-dir <path> --run-id <uuid>` independently re-derives PRD AC1 (continuity),
 AC2 (clean completion), and AC3 (artifact reference and production) from a completed run's own
 persisted handoff records, offline and without trusting anything the run itself reported live.
+`multi-loopr mcp` starts a local, stdio-only Model Context Protocol server that exposes the same
+`run`/`drive`/`doctor`/`evidence` capabilities as MCP tools, so an MCP-capable client (Claude Code,
+or any other MCP host) can drive a phased build conversationally without hand-constructing a config
+file and shelling out to the CLI directly. Every tool call does exactly what the equivalent CLI
+invocation would do -- it is a thin translation layer over the same commands, not a second
+orchestration engine.
 
 ## Examples
 

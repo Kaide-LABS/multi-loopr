@@ -32,7 +32,8 @@ export const BOUNDARY_RULES: readonly BoundaryRule[] = [
   {
     id: "B2",
     description:
-      "Any runtime dependencies entry in package.json outside the allowlist (zod only in V1) -- " +
+      "Any runtime dependencies entry in package.json outside the allowlist (zod and " +
+      "@modelcontextprotocol/sdk, and no other runtime dependency -- amended Phase 8 MCP server pass) -- " +
       "prevents a hosted/closed orchestration SDK entering by the side door.",
     kind: "manifest",
     exitCode: 7,
