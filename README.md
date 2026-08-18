@@ -26,6 +26,22 @@ file and shelling out to the CLI directly. Every tool call does exactly what the
 invocation would do -- it is a thin translation layer over the same commands, not a second
 orchestration engine.
 
+## Setup
+
+`multi-loopr setup` registers three stdio MCP servers into your Claude Code configuration in one
+non-interactive command: `multi-loopr`'s own server, plus two optional research servers,
+`arxiv-mcp` and `paper-search-mcp`, that give loopr's own Step 10 research pass access to arXiv and
+broader academic search. All three are registered at `user` scope, so the registration is not tied
+to any one project directory. Each server is attempted independently and verified afterward with an
+independent `claude mcp get` check -- a registration is only ever reported as "registered" once that
+check confirms it, never from `claude mcp add`'s exit code alone.
+
+**arXiv and paper-search are optional -- multi-loopr works fully without them.** If either cannot be
+installed on your machine (no `uvx` and no importable Python module), `setup` skips it by name with
+a plain-language reason and a copy-pasteable remediation line; it never fails the command, and a
+subsequent `run`/`drive` invocation still completes exactly the same either way. Re-running
+`multi-loopr setup` at any time is safe and idempotent: an already-registered server is left alone.
+
 ## Examples
 
 `examples/toy-build/` is a small, real, two-file Node.js CLI build (`wordcount.mjs`) with its own

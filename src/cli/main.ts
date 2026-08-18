@@ -18,6 +18,9 @@ import { runEvidenceCommand } from "./evidence.ts";
 import type { DriveCommandOptions, DriveReport } from "./drive.ts";
 import { runDriveCommand } from "./drive.ts";
 import { runMcpServer } from "../mcp/server.ts";
+import type { SetupReport } from "./setup.ts";
+import { renderSetupHumanReport, runSetupCommand } from "./setup.ts";
+import { probeOptionalResearchServers, renderOptionalResearchNote } from "../setup/registry.ts";
 
 const USAGE_TEXT = `Usage: multi-loopr <command> [options]
 
@@ -38,6 +41,9 @@ Commands:
                                               ambiguous or incoherent filesystem read.
   multi-loopr mcp                             Start a local, stdio-only Model Context Protocol server
                                               exposing run/drive/doctor/evidence as MCP tools.
+  multi-loopr setup [--json]                  Register multi-loopr's own MCP server plus the two
+                                              optional research servers (arxiv-mcp, paper-search-mcp)
+                                              into your Claude Code configuration, at user scope.
 `;
 
 type Command =
@@ -47,7 +53,8 @@ type Command =
   | ({ readonly kind: "run" } & RunCommandOptions)
   | ({ readonly kind: "evidence" } & EvidenceCommandOptions)
   | ({ readonly kind: "drive" } & DriveCommandOptions)
-  | { readonly kind: "mcp" };
+  | { readonly kind: "mcp" }
+  | { readonly kind: "setup"; readonly json: boolean };
 
 function parseDoctorArgs(rest: readonly string[]): Command {
   let json = false;
@@ -199,6 +206,26 @@ function parseMcpArgs(rest: readonly string[]): Command {
   return { kind: "mcp" };
 }
 
+/**
+ * Parses `setup`'s flags: `--json` only. Any other argument -> `UsageError` -- unknown flags are
+ * never ignored, the same rule every existing CLI surface in this project already enforces. There
+ * is deliberately no `--scope`/`--only`/`--skip` flag (PHASE_9_SPEC.md §4.1, §9 non-goals 5).
+ * Mirrors `parseDriveArgs`' own shape, minus the `--config` branch.
+ */
+function parseSetupArgs(rest: readonly string[]): Command {
+  let json = false;
+
+  for (const arg of rest) {
+    if (arg === "--json") {
+      json = true;
+    } else {
+      throw new UsageError(`Unknown flag for setup: ${String(arg)}`, { flag: arg });
+    }
+  }
+
+  return { kind: "setup", json };
+}
+
 /** Parses `argv` (the full `process.argv`-shaped array; `argv.slice(2)` is the user's own args). */
 function parseArgs(argv: readonly string[]): Command {
   const args = argv.slice(2);
@@ -228,6 +255,9 @@ function parseArgs(argv: readonly string[]): Command {
   }
   if (first === "mcp") {
     return parseMcpArgs(args.slice(1));
+  }
+  if (first === "setup") {
+    return parseSetupArgs(args.slice(1));
   }
 
   throw new UsageError(`Unknown command: ${args.join(" ")}`, { argv: args });
@@ -396,8 +426,13 @@ export async function main(argv: readonly string[]): Promise<number> {
         return exitCode;
       }
       case "run": {
+        const notePromise = probeOptionalResearchServers();
         const { report, exitCode } = await runRunCommand({ configPath: command.configPath, json: command.json });
         process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderRunHumanReport(report));
+        const note = renderOptionalResearchNote(await notePromise);
+        if (note !== null) {
+          process.stderr.write(note);
+        }
         return exitCode;
       }
       case "evidence": {
@@ -411,13 +446,26 @@ export async function main(argv: readonly string[]): Promise<number> {
         return exitCode;
       }
       case "drive": {
+        const notePromise = probeOptionalResearchServers();
         const { report, exitCode } = await runDriveCommand({ configPath: command.configPath, json: command.json });
         process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderDriveHumanReport(report));
+        const note = renderOptionalResearchNote(await notePromise);
+        if (note !== null) {
+          process.stderr.write(note);
+        }
         return exitCode;
       }
       case "mcp": {
         await runMcpServer();
         return ExitCode.OK;
+      }
+      case "setup": {
+        const { report, exitCode } = await runSetupCommand({
+          json: command.json,
+          entryPath: fileURLToPath(import.meta.url),
+        });
+        process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderSetupHumanReport(report));
+        return exitCode;
       }
     }
     // Exhaustive per the Command union above; unreachable, but satisfies noImplicitReturns.

@@ -32,6 +32,8 @@ export const ExitCode = {
   DRIVER_HALTED_MAX_PHASES: 16,
   /** BUILD_COMPLETE.md already existed at the target repo root before a driver invocation dispatched anything (PHASE_6_SPEC.md §3.4/§6.1). */
   DRIVER_START_INCOHERENT: 17,
+  /** `claude` CLI was found, but `multi-loopr`'s own server ended in a non-success outcome (PHASE_9_SPEC.md §4.2). */
+  SETUP_FAILED: 18,
 } as const;
 
 /** The type of a value in {@link ExitCode}. */
@@ -144,6 +146,16 @@ export class RunHaltedError extends MultiLooprError {
 export class LooprArtifactBypassError extends MultiLooprError {
   readonly exitCode = ExitCode.LOOPR_ARTIFACT_BYPASSED;
   readonly code = "LOOPR_ARTIFACT_BYPASSED";
+}
+
+/**
+ * A genuine internal defect in the `setup` command path. Thrown only for a bug, never for a normal
+ * registration failure -- the normal failure route is a non-zero `exit_code` returned inside
+ * `{ report, exitCode }`, matching every other command in this project (PHASE_9_SPEC.md §1.6).
+ */
+export class SetupError extends MultiLooprError {
+  readonly exitCode = ExitCode.SETUP_FAILED;
+  readonly code = "SETUP_FAILED";
 }
 
 /**
