@@ -68,6 +68,31 @@ test("B2: fires on a non-zod runtime dependency, silent when dependencies is zod
   }
 });
 
+test("B2 (amended, PHASE_8_SPEC.md §7 FM-M3): silent on the closed two-key allowlist (zod + @modelcontextprotocol/sdk), still fires on a third, unauthorized dependency key added alongside both", async () => {
+  const allowed = await fixtureRepo(
+    { "src/fixture.ts": "export const x = 1;\n" },
+    { dependencies: { zod: "4.4.3", "@modelcontextprotocol/sdk": "1.30.0" } },
+  );
+  try {
+    assert.ok(!hasRule(await scanBoundary(allowed.dir), "B2"));
+  } finally {
+    await allowed.cleanup();
+  }
+
+  const thirdDependency = await fixtureRepo(
+    { "src/fixture.ts": "export const x = 1;\n" },
+    { dependencies: { zod: "4.4.3", "@modelcontextprotocol/sdk": "1.30.0", "third-pkg": "1.0.0" } },
+  );
+  try {
+    const violations = await scanBoundary(thirdDependency.dir);
+    assert.ok(hasRule(violations, "B2"));
+    assert.ok(violations.some((v) => v.rule === "B2" && v.excerpt === "third-pkg"));
+    assert.equal(violations.filter((v) => v.rule === "B2").length, 1);
+  } finally {
+    await thirdDependency.cleanup();
+  }
+});
+
 test("B3: fires on a node:net import, silent on a zod-only import", async () => {
   const positive = await fixtureRepo({ "src/fixture.ts": 'import net from "node:net";\n' });
   try {
