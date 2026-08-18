@@ -5,7 +5,9 @@ dist/
 .loopr-state/
 
 # Internal build-process documents for multi-loopr's own construction (via loopr) -- not part of
-# the shipped tool. Untracked going forward; still present in earlier commit history.
-PHASE_*_SPEC.md
-multi-loopr-PRD.md
-COMPREHENSION.md
+# the shipped tool. Untracked going forward; still present in earlier commit history. Anchored to
+# repo root (a leading /) so this never shadows a same-named file legitimately shipped elsewhere in
+# the tree, e.g. an examples/** fixture's own PHASE_1_SPEC.md.
+/PHASE_*_SPEC.md
+/multi-loopr-PRD.md
+/COMPREHENSION.md
