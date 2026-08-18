@@ -11,6 +11,12 @@
 // FM-D4 (PHASE_6_SPEC.md §7): this file imports nothing from `src/dispatch/turn.ts`,
 // `src/dispatch/prompt.ts`, `src/dispatch/record.ts`, `src/verify/continuity.ts`, `src/adapters/**`,
 // or `node:child_process`, and contains no `git` string literal.
+//
+// Corroborating literature (multi-loopr-PRD.md §8.5, MODERNIZATION CHANGELOG 2026-08-18 item I.4):
+// Madatha, "A Deterministic Control Plane for LLM Coding Agents," arXiv:2606.26924, §3.3/§4.5 --
+// independently validates a hard-coded, deterministic phase-gating control layer above an LLM agent
+// harness (block-on-violation, never guess) as an actively published 2026 pattern for this problem
+// class, corroborating kaide-loop's controller.py as a second, not primary, source.
 
 import type { DriverDecisionKind, DriverStateId } from "../domain/driver.ts";
 import { ExitCode, InternalError } from "../domain/errors.ts";
