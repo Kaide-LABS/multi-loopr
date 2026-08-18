@@ -232,3 +232,24 @@ test("USAGE_TEXT contains a multi-loopr mcp line", async () => {
   const { stdout } = await runMain(["--help"]);
   assert.match(stdout, /multi-loopr mcp\s+Start a local, stdio-only Model Context Protocol server/);
 });
+
+// PHASE_9_SPEC.md §7 FM-I3 reviewer check (c): "parseSetupArgs rejects --scope as an unknown flag
+// (a test asserts the UsageError)." parseArgs/parseSetupArgs are synchronous and throw before any
+// I/O is attempted, so this is safe to drive through the real `main.ts` entry point -- no `claude`
+// CLI is ever shelled out to and no MCP config is touched.
+test("--scope is an unknown flag for setup and is rejected (exit 2) -- PHASE_9_SPEC.md §7 FM-I3(c)", async () => {
+  const { exitCode, stderr } = await runMain(["setup", "--scope", "user"]);
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /Unknown flag for setup/);
+});
+
+test("any unrecognized flag passed to setup is a usage error (exit 2)", async () => {
+  const { exitCode, stderr } = await runMain(["setup", "--not-a-real-flag"]);
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /Unknown flag for setup/);
+});
+
+test("USAGE_TEXT contains a multi-loopr setup line", async () => {
+  const { stdout } = await runMain(["--help"]);
+  assert.match(stdout, /multi-loopr setup \[--json\]\s+Register multi-loopr's own MCP server/);
+});

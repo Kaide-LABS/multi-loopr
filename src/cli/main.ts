@@ -18,7 +18,6 @@ import { runEvidenceCommand } from "./evidence.ts";
 import type { DriveCommandOptions, DriveReport } from "./drive.ts";
 import { runDriveCommand } from "./drive.ts";
 import { runMcpServer } from "../mcp/server.ts";
-import type { SetupReport } from "./setup.ts";
 import { renderSetupHumanReport, runSetupCommand } from "./setup.ts";
 import { probeOptionalResearchServers, renderOptionalResearchNote } from "../setup/registry.ts";
 
