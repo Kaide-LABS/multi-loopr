@@ -5,7 +5,7 @@
 // `Invocation`/`TurnRequest` (PHASE_1_SPEC.md §3.6).
 
 import { InternalError } from "../domain/errors.ts";
-import type { ProviderId, RunConfig } from "../domain/run.ts";
+import type { ProviderId, RolePin, RunConfig } from "../domain/run.ts";
 import { PROVIDER_IDS } from "../domain/run.ts";
 
 /**
@@ -16,6 +16,15 @@ import { PROVIDER_IDS } from "../domain/run.ts";
 export interface TurnPlan {
   readonly archetype: "executor" | "reviewer";
   readonly provider: ProviderId;
+  /**
+   * `true` iff this slot is the reviewer slot and its resolved provider is the same provider that
+   * filled the second executor slot -- the provider whose diff this reviewer turn reviews. Always
+   * `false` for an executor slot. Computed structurally from `role_pins`' own elimination logic
+   * (§6.1), never from an actual git diff -- `planTurnSequence` has no I/O and needs none to know
+   * this. Implements PHASE_7_SPEC.md §3.1/§6.1, `.claude/loopr-role-pinning/baby_prd.md` acceptance
+   * criterion 3.
+   */
+  readonly reviewerReviewedOwnWork: boolean;
 }
 
 /**
@@ -36,20 +45,66 @@ export function otherProviderId(id: ProviderId): ProviderId {
   return other;
 }
 
+/** `true` iff `config.role_pins` pins `provider` to `role`. */
+function isPinned(config: RunConfig, provider: ProviderId, role: RolePin): boolean {
+  return config.role_pins?.[provider] === role;
+}
+
 /**
- * [DET, DECISION Phase 3] Resolves PRD §6.3's DECISION into the concrete, ordered, three-slot V1
- * turn sequence for one run: two executor slots, ordered exactly as `executor_providers` (already
- * validated as two *different* provider ids by `RunConfig`'s own `.refine`), then one reviewer
- * slot whose provider defaults to whichever provider did *not* produce the diff under review
- * (`otherProviderId(executor_providers[1])`, necessarily `executor_providers[0]` in a fixed
- * two-provider system) unless the operator set `reviewer_provider` explicitly. No other archetype
- * ever appears. Implements PHASE_3_SPEC.md §6.1.
+ * [DET, DECISION Phase 3, AMENDED Phase 7 §6.3a] Resolves PRD §6.3's DECISION -- extended by §6.3a
+ * to admit operator role pinning -- into the concrete, ordered, three-slot V1 turn sequence for one
+ * run: two executor slots, then one reviewer slot. With no `role_pins` set, this is byte-identical
+ * to the pre-Phase-7 behaviour: executor slots ordered exactly as `executor_providers`, reviewer
+ * slot defaulting to whichever provider did *not* produce the diff under review
+ * (`otherProviderId(executor_providers[1])`) unless the operator set `reviewer_provider`
+ * explicitly (PHASE_7_SPEC.md §6.1 worked table row 1, AC2). A `role_pins` pinning a provider to
+ * `"reviewer"` removes it from the executor pool (collapsing both executor slots onto the sole
+ * remaining eligible provider, RP1 guarantees this pool is never empty); a `role_pins` pinning a
+ * provider to `"executor"` removes it from reviewer eligibility. No other archetype ever appears.
+ * Implements PHASE_3_SPEC.md §6.1, PHASE_7_SPEC.md §6.1.
  */
 export function planTurnSequence(config: RunConfig): readonly TurnPlan[] {
   const [firstExecutor, secondExecutor] = config.executor_providers;
+
+  // Executor pool: every provider NOT pinned "reviewer" is eligible to fill an executor slot. RP1
+  // (PHASE_7_SPEC.md §3.3) guarantees this pool is never empty.
+  const executorPool = PROVIDER_IDS.filter((p) => !isPinned(config, p, "reviewer"));
+
+  const [execA, execB]: readonly [ProviderId, ProviderId] =
+    executorPool.length === 2
+      ? [firstExecutor, secondExecutor] // byte-identical to today's default (AC2) -- nobody is pinned "reviewer"
+      : [executorPool[0] as ProviderId, executorPool[0] as ProviderId]; // collapse: the sole eligible provider fills both executor slots
+
+  // The provider whose diff the reviewer slot reviews is always the second executor slot's
+  // provider -- unchanged from today's definition (`run-loop.ts`'s own diff computation keys off
+  // exactly this slot, PHASE_3_SPEC.md §6.1).
+  const diffWriter = execB;
+
+  const pinnedReviewer = PROVIDER_IDS.find((p) => isPinned(config, p, "reviewer")) ?? null;
+
+  let reviewerProvider: ProviderId;
+  if (pinnedReviewer !== null) {
+    // A provider pinned "reviewer" is always the reviewer when one exists -- RP4 (§3.3) guarantees
+    // this agrees with `reviewer_provider` if that was also set explicitly.
+    reviewerProvider = pinnedReviewer;
+  } else if (config.reviewer_provider !== null) {
+    // Today's existing explicit override, unaffected when no provider is pinned "reviewer". RP3
+    // (§3.3) already guarantees this is not pinned "executor".
+    reviewerProvider = config.reviewer_provider;
+  } else {
+    // Today's existing default: whichever provider did not write the diff under review.
+    const naiveDefault = otherProviderId(diffWriter);
+    // If the naive default is pinned "executor" it is banned from the reviewer role (§6.3a). With
+    // exactly two providers and no provider pinned "reviewer" in this branch (else we would already
+    // be in the `pinnedReviewer !== null` branch above), the diff-writer itself is the only
+    // remaining candidate -- RP2 (§3.3) guarantees at least one of {naiveDefault, diffWriter} is not
+    // pinned "executor", so this always resolves to a valid provider.
+    reviewerProvider = isPinned(config, naiveDefault, "executor") ? diffWriter : naiveDefault;
+  }
+
   return [
-    { archetype: "executor", provider: firstExecutor },
-    { archetype: "executor", provider: secondExecutor },
-    { archetype: "reviewer", provider: config.reviewer_provider ?? otherProviderId(secondExecutor) },
+    { archetype: "executor", provider: execA, reviewerReviewedOwnWork: false },
+    { archetype: "executor", provider: execB, reviewerReviewedOwnWork: false },
+    { archetype: "reviewer", provider: reviewerProvider, reviewerReviewedOwnWork: reviewerProvider === diffWriter },
   ];
 }

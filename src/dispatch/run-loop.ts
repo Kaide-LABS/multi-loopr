@@ -68,6 +68,14 @@ export interface RunResult {
   readonly turns: readonly TurnAttemptSummary[];
   readonly halt: HaltSignal | null;
   readonly problems: readonly string[];
+  /**
+   * Non-empty iff some reviewer slot in this run's `planTurnSequence` output had
+   * `reviewerReviewedOwnWork === true` -- surfaced here, not only in an internal log, per
+   * `.claude/loopr-role-pinning/baby_prd.md` acceptance criterion 3. Always `[]` for a run whose
+   * `RunConfig.role_pins` is absent or produces no such slot -- every pre-Phase-7 fixture is
+   * unaffected. Implements PHASE_7_SPEC.md §6.2.
+   */
+  readonly warnings: readonly string[];
 }
 
 /**
@@ -286,14 +294,14 @@ async function runExtendedPreflight(
 export async function runDispatch(config: RunConfig, deps?: RunDispatchDeps): Promise<RunResult> {
   const preflight = await runExtendedPreflight(config, deps?.preflightFn ?? runPreflight);
   if (!preflight.ok) {
-    return { ok: false, exitCode: ExitCode.PREFLIGHT_FAILED, turns: [], halt: null, problems: preflight.problems };
+    return { ok: false, exitCode: ExitCode.PREFLIGHT_FAILED, turns: [], halt: null, problems: preflight.problems, warnings: [] };
   }
 
   try {
     await acquireRunLock(config.repo_dir, config.run_id);
   } catch (err) {
     if (err instanceof LockHeldError) {
-      return { ok: false, exitCode: ExitCode.LOCK_HELD, turns: [], halt: null, problems: [err.message] };
+      return { ok: false, exitCode: ExitCode.LOCK_HELD, turns: [], halt: null, problems: [err.message], warnings: [] };
     }
     throw err;
   }
@@ -337,11 +345,19 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
 
   const plan = planTurnSequence(config);
   const turns: TurnAttemptSummary[] = [];
+  const warnings: string[] = [];
   let attemptCounter = 0;
   let prevRecord: HandoffRecord | null = null;
   let firstTurnHeadBefore: string | null = null;
 
   for (const [slotIndex, slot] of plan.entries()) {
+    if (slot.archetype === "reviewer" && slot.reviewerReviewedOwnWork) {
+      warnings.push(
+        `Turn ${String(attemptCounter)} (reviewer/${slot.provider}) is reviewing its own prior work: ` +
+          `role_pins left no other provider eligible for the reviewer role this run.`,
+      );
+    }
+
     const adapter = adapters[slot.provider];
 
     let diff: string | null = null;
@@ -372,6 +388,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
         turns,
         halt: null,
         problems: [result.outcome.failure?.message ?? "turn failed with no further detail"],
+        warnings: [...warnings],
       };
     }
 
@@ -384,6 +401,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
         turns,
         halt: record.halt,
         problems: [record.halt?.message ?? `turn reported status "${record.status}"`],
+        warnings: [...warnings],
       };
     }
 
@@ -484,6 +502,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
         turns,
         halt: null,
         problems: [retryResult.outcome.failure?.message ?? "turn failed with no further detail"],
+        warnings: [...warnings],
       };
     }
 
@@ -496,6 +515,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
         turns,
         halt: retryRecord.halt,
         problems: [retryRecord.halt?.message ?? `turn reported status "${retryRecord.status}"`],
+        warnings: [...warnings],
       };
     }
 
@@ -519,6 +539,7 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
             `${verdict.verdict} (failed: ${verdict.failedCheckIds.join(", ") || "none"}), retry verdict ` +
             `${retryVerdict.verdict} (failed: ${retryVerdict.failedCheckIds.join(", ") || "none"}).`,
         ],
+        warnings: [...warnings],
       };
     }
 
@@ -533,5 +554,5 @@ async function runTurnLoop(config: RunConfig, deps?: RunDispatchDeps): Promise<R
     prevRecord = retryRecord;
   }
 
-  return { ok: true, exitCode: ExitCode.OK, turns, halt: null, problems: [] };
+  return { ok: true, exitCode: ExitCode.OK, turns, halt: null, problems: [], warnings: [...warnings] };
 }

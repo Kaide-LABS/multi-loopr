@@ -68,17 +68,37 @@ export type AuthProbeState = (typeof AUTH_PROBE_STATES)[number];
 /** zod schema for {@link AuthProbeState}. */
 export const AuthProbeStateSchema = z.enum(AUTH_PROBE_STATES);
 
+/** The two roles an operator may pin a provider to (PRD §6.3a). Implements PHASE_7_SPEC.md §3.1. */
+export const ROLE_PINS = ["executor", "reviewer"] as const;
+
+/** A member of {@link ROLE_PINS}. */
+export type RolePin = (typeof ROLE_PINS)[number];
+
+/** zod schema for {@link RolePin}. */
+export const RolePinSchema = z.enum(ROLE_PINS);
+
 /**
  * Operator-supplied run configuration. Phase 1 defines and validates it; Phase 3's dispatch loop
  * is its only consumer.
  */
-export const RunConfig = z.strictObject({
+const RunConfigShape = z.strictObject({
   run_id: z.uuid(),
   repo_dir: z.string().min(1),
   executor_providers: z
     .tuple([ProviderIdSchema, ProviderIdSchema])
     .refine(([a, b]) => a !== b, "executor_providers must be two different provider ids"),
   reviewer_provider: ProviderIdSchema.nullable().default(null),
+  /**
+   * Pins a provider exclusively to the executor role, exclusively to the reviewer role, or leaves it
+   * unpinned (absent from this record -- today's default alternation, PRD §6.3). A sparse,
+   * per-provider record, mirroring `model_overrides`'s own existing `z.partialRecord` shape rather
+   * than introducing a new config-representation pattern (PRD §8.6 item 6). Cross-field validity
+   * (RP1-RP4, §3.3) is enforced by this schema's own object-level `.refine()` chain, not by
+   * `planTurnSequence` or any runtime check inside `runDispatch` -- the same "schema is the single
+   * source of validity" precedent `executor_providers`'s own `.refine()` already established.
+   * Implements PHASE_7_SPEC.md §3.1.
+   */
+  role_pins: z.partialRecord(ProviderIdSchema, RolePinSchema).optional(),
   turn_timeout_ms: z.number().int().min(1000).max(7_200_000).default(1_800_000),
   model_overrides: z.partialRecord(ProviderIdSchema, z.string().min(1)).optional(),
   /** Which loopr phase this run dispatches (PHASE_3_SPEC.md §1.3). */
@@ -118,6 +138,45 @@ export const RunConfig = z.strictObject({
   /** Same treatment as {@link RunConfig.executor_prompt_path}, for loopr's Step 12 (adversarial review + phase advancement) prompt. */
   reviewer_prompt_path: RepoRelPathLike.optional(),
 });
+
+/**
+ * Object-level role-pinning refinements (RP1-RP4), chained onto {@link RunConfigShape}. Mirrors
+ * `src/domain/relay.ts`'s `HandoffRecordShape.refine(...).refine(...)` idiom exactly: one named
+ * rule per genuinely distinct invariant, independently nameable and independently testable, rather
+ * than one combined boolean predicate. `PROVIDER_IDS` (not a hardcoded two-provider check) is used
+ * so each refinement reads as a general "no role is left without an eligible provider" invariant.
+ * Implements PHASE_7_SPEC.md §3.3.
+ *
+ * Deliberately does **not** check whether a pinned reviewer would end up reviewing its own prior
+ * work (`reviewerReviewedOwnWork`, `src/dispatch/plan.ts` §6.1) -- that is a structurally valid
+ * configuration whose *consequence* is surfaced loudly at dispatch time (`RunResult.warnings`),
+ * never rejected at parse time (PHASE_7_SPEC.md §3.3).
+ */
+export const RunConfig = RunConfigShape.refine(
+  (c) => PROVIDER_IDS.some((p) => c.role_pins?.[p] !== "reviewer"),
+  {
+    message: "role_pins must not pin every provider to reviewer -- no provider would be left eligible for the executor role (RP1)",
+    path: ["role_pins"],
+  },
+).refine(
+  (c) => PROVIDER_IDS.some((p) => c.role_pins?.[p] !== "executor"),
+  {
+    message: "role_pins must not pin every provider to executor -- no provider would be left eligible for the reviewer role (RP2)",
+    path: ["role_pins"],
+  },
+).refine(
+  (c) => c.reviewer_provider === null || c.role_pins?.[c.reviewer_provider] !== "executor",
+  {
+    message: "reviewer_provider names a provider role_pins has pinned to executor -- conflicting reviewer configuration (RP3)",
+    path: ["reviewer_provider"],
+  },
+).refine(
+  (c) => c.reviewer_provider === null || PROVIDER_IDS.every((p) => p === c.reviewer_provider || c.role_pins?.[p] !== "reviewer"),
+  {
+    message: "reviewer_provider disagrees with the provider role_pins has pinned to reviewer -- conflicting reviewer configuration (RP4)",
+    path: ["reviewer_provider"],
+  },
+);
 
 /** The inferred type of {@link RunConfig}. */
 export type RunConfig = z.infer<typeof RunConfig>;

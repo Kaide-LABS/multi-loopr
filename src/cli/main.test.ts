@@ -48,6 +48,11 @@ test("--help prints usage to stdout only and exits 0", async () => {
   assert.equal(stderr, "");
 });
 
+test("--help's run line names pinned-role behavior (PHASE_7_SPEC.md §4.3, baby_prd.md AC6)", async () => {
+  const { stdout } = await runMain(["--help"]);
+  assert.match(stdout, /role_pins|pinned/);
+});
+
 test("no arguments at all behaves like --help", async () => {
   const { exitCode, stdout } = await runMain([]);
   assert.equal(exitCode, 0);

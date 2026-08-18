@@ -49,7 +49,7 @@ function validDriveConfigJson(dir: string, overrides: Partial<Record<string, unk
 }
 
 function okResult(exitCode = 0): RunResult {
-  return { ok: true, exitCode, turns: [], halt: null, problems: [] };
+  return { ok: true, exitCode, turns: [], halt: null, problems: [], warnings: [] };
 }
 
 test("runDriveCommand throws UsageError (exit 2) when the config file cannot be read", async () => {

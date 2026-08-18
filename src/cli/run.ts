@@ -32,6 +32,7 @@ export const RunReport = z.strictObject({
   ),
   halt: HaltSignal.nullable(),
   problems: z.array(z.string()),
+  warnings: z.array(z.string()),
 });
 
 /** The inferred type of {@link RunReport}. */
@@ -110,6 +111,7 @@ export async function runRunCommand(
     })),
     halt: dispatchResult.halt,
     problems: [...dispatchResult.problems],
+    warnings: [...dispatchResult.warnings],
   };
 
   return { report, exitCode: dispatchResult.exitCode };

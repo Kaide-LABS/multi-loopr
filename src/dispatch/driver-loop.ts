@@ -144,6 +144,7 @@ function buildPhaseRunConfig(config: DriveConfig, phase: number, specPath: strin
     ...(config.model_overrides !== undefined ? { model_overrides: config.model_overrides } : {}),
     ...(config.executor_prompt_path !== undefined ? { executor_prompt_path: config.executor_prompt_path } : {}),
     ...(config.reviewer_prompt_path !== undefined ? { reviewer_prompt_path: config.reviewer_prompt_path } : {}),
+    ...(config.role_pins !== undefined ? { role_pins: config.role_pins } : {}),
   };
 }
 

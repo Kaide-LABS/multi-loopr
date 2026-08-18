@@ -14,7 +14,7 @@
 // leaf module that neither `relay.ts` nor `run.ts` imports from, so no cycle risk exists here.
 
 import { z } from "zod";
-import { ProviderIdSchema } from "./run.ts";
+import { PROVIDER_IDS, ProviderIdSchema, RolePinSchema } from "./run.ts";
 import { IsoUtc, RepoRelPath } from "./relay.ts";
 
 /**
@@ -22,7 +22,7 @@ import { IsoUtc, RepoRelPath } from "./relay.ts";
  * may dispatch many `RunConfig`s (one per target-build phase) over its lifetime. Implements
  * PHASE_6_SPEC.md §3.1.
  */
-export const DriveConfig = z.strictObject({
+const DriveConfigShape = z.strictObject({
   repo_dir: z.string().min(1),
   /** Identifies this driver invocation's own dispatch-log directory (§3.5) -- distinct from, and never reused as, any individual phase's `RunConfig.run_id`. */
   driver_run_id: z.uuid(),
@@ -48,11 +48,46 @@ export const DriveConfig = z.strictObject({
     .tuple([ProviderIdSchema, ProviderIdSchema])
     .refine(([a, b]) => a !== b, "executor_providers must be two different provider ids"),
   reviewer_provider: ProviderIdSchema.nullable().default(null),
+  /** Same treatment as {@link RunConfig.role_pins} -- threaded unchanged into every phase's own
+   * `RunConfig` by `buildPhaseRunConfig` (`src/dispatch/driver-loop.ts` §1.1). Implements
+   * PHASE_7_SPEC.md §3.2. */
+  role_pins: z.partialRecord(ProviderIdSchema, RolePinSchema).optional(),
   turn_timeout_ms: z.number().int().min(1000).max(7_200_000).default(1_800_000),
   model_overrides: z.partialRecord(ProviderIdSchema, z.string().min(1)).optional(),
   executor_prompt_path: RepoRelPath.optional(),
   reviewer_prompt_path: RepoRelPath.optional(),
 });
+
+/**
+ * Object-level role-pinning refinements (RP1-RP4), byte-identical in substance to
+ * `src/domain/run.ts`'s `RunConfig` refinements, chained onto {@link DriveConfigShape}'s own field
+ * list. Implements PHASE_7_SPEC.md §3.3.
+ */
+export const DriveConfig = DriveConfigShape.refine(
+  (c) => PROVIDER_IDS.some((p) => c.role_pins?.[p] !== "reviewer"),
+  {
+    message: "role_pins must not pin every provider to reviewer -- no provider would be left eligible for the executor role (RP1)",
+    path: ["role_pins"],
+  },
+).refine(
+  (c) => PROVIDER_IDS.some((p) => c.role_pins?.[p] !== "executor"),
+  {
+    message: "role_pins must not pin every provider to executor -- no provider would be left eligible for the reviewer role (RP2)",
+    path: ["role_pins"],
+  },
+).refine(
+  (c) => c.reviewer_provider === null || c.role_pins?.[c.reviewer_provider] !== "executor",
+  {
+    message: "reviewer_provider names a provider role_pins has pinned to executor -- conflicting reviewer configuration (RP3)",
+    path: ["reviewer_provider"],
+  },
+).refine(
+  (c) => c.reviewer_provider === null || PROVIDER_IDS.every((p) => p === c.reviewer_provider || c.role_pins?.[p] !== "reviewer"),
+  {
+    message: "reviewer_provider disagrees with the provider role_pins has pinned to reviewer -- conflicting reviewer configuration (RP4)",
+    path: ["reviewer_provider"],
+  },
+);
 
 /** The inferred type of {@link DriveConfig}. */
 export type DriveConfig = z.infer<typeof DriveConfig>;

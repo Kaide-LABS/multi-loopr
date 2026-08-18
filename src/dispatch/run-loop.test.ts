@@ -1011,3 +1011,196 @@ test("runDispatch: a LooprArtifactBypassError on the first turn propagates uncau
     await cleanup(dir);
   }
 });
+
+// -------------------------------------------------------------------------------------------
+// PHASE_7_SPEC.md §8 acceptance criteria 1 and 3 -- role pinning, end-to-end through runDispatch.
+// -------------------------------------------------------------------------------------------
+
+test("runDispatch (AC1): role_pins: {A: executor, B: reviewer} produces clean role separation -- no turn has reviewer/A or executor/B, and warnings stays empty", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir, { role_pins: { "claude-code": "executor", "codex-cli": "reviewer" } });
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "codex-cli"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.turns.length, 3);
+    assert.deepStrictEqual(
+      result.turns.map((t) => [t.archetype, t.provider]),
+      [
+        ["executor", "claude-code"],
+        ["executor", "claude-code"],
+        ["reviewer", "codex-cli"],
+      ],
+    );
+    assert.ok(!result.turns.some((t) => t.archetype === "reviewer" && t.provider === "claude-code"));
+    assert.ok(!result.turns.some((t) => t.archetype === "executor" && t.provider === "codex-cli"));
+    assert.deepStrictEqual(result.warnings, []);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch (AC3): a role_pins state that collapses the reviewer onto the diff-writer produces exactly one non-empty warning naming the provider", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    // §6.1 worked table row 2: {A: executor} only, A === executor_providers[0] -- the naive
+    // reviewer default (otherProviderId(executor_providers[1]) === A) is banned, so the reviewer
+    // slot falls back to executor_providers[1] itself: it reviews the diff it just wrote.
+    const config = baseConfig(dir, { role_pins: { "claude-code": "executor" } });
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "codex-cli"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(
+      result.turns.map((t) => [t.archetype, t.provider]),
+      [
+        ["executor", "claude-code"],
+        ["executor", "codex-cli"],
+        ["reviewer", "codex-cli"],
+      ],
+    );
+    assert.equal(result.warnings.length, 1);
+    assert.ok(result.warnings[0]?.includes("codex-cli"));
+    assert.ok(result.warnings[0]?.toLowerCase().includes("own prior work"));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runDispatch: RunResult.warnings is [] for a config with no role_pins (pre-Phase-7 fixture shape, unaffected by this phase)", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const config = baseConfig(dir);
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "claude-code"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const result = await runDispatch(config, { adapters, runProcessFn, preflightFn: fakeHealthyPreflight });
+
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.warnings, []);
+  } finally {
+    await cleanup(dir);
+  }
+});

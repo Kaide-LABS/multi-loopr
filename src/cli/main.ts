@@ -27,7 +27,8 @@ Commands:
                                               boundary scan, and a lock smoke test.
   multi-loopr doctor --boundary [--json]     Boundary scan only (fast, no provider probes).
   multi-loopr doctor --providers [--json]    Provider preflight only.
-  multi-loopr run --config <path> [--json]   Dispatch one loopr phase's turn sequence.
+  multi-loopr run --config <path> [--json]   Dispatch one loopr phase's turn sequence. Providers may
+                                              be pinned to a fixed role via the config's role_pins.
   multi-loopr evidence --repo-dir <path> --run-id <uuid> [--final-phase] [--json]
                                               Re-derive AC1/AC2/AC3 evidence for a completed run
                                               from its persisted handoff records.
@@ -287,6 +288,13 @@ function renderRunHumanReport(report: RunReport): string {
   if (report.halt !== null) {
     lines.push("");
     lines.push(`halt: ${report.halt.code} -- ${report.halt.message}`);
+  }
+  if (report.warnings.length > 0) {
+    lines.push("");
+    lines.push("Warnings:");
+    for (const warning of report.warnings) {
+      lines.push(`  - ${warning}`);
+    }
   }
   if (report.problems.length > 0) {
     lines.push("");

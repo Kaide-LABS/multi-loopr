@@ -390,6 +390,140 @@ test("RunConfig.model_overrides accepts a sparse record (one provider key set, t
   assert.equal(RunConfig.safeParse({ ...base, model_overrides: { "not-a-real-provider": "opus" } }).success, false);
 });
 
+// -------------------------------------------------------------------------------------------
+// PHASE_7_SPEC.md §3.1/§3.3 -- role_pins round-trip and RP1-RP4 rejections. Colocated here
+// (rather than a separate src/domain/run.test.ts, which does not exist in this codebase) matching
+// this file's own established convention of testing every RunConfig field's own validator inline.
+// -------------------------------------------------------------------------------------------
+
+function rolePinBase(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    run_id: RUN_ID,
+    repo_dir: "/tmp/repo",
+    executor_providers: ["claude-code", "codex-cli"],
+    phase: 1,
+    spec_path: "PHASE_1_SPEC.md",
+    baby_prd_path: "baby_prd.md",
+    context_path: "context.md",
+    ...overrides,
+  };
+}
+
+test("RunConfig.role_pins round-trips every valid pin combination and is absent by default", () => {
+  const omitted = RunConfig.safeParse(rolePinBase());
+  assert.equal(omitted.success, true);
+  assert.equal(omitted.success ? omitted.data.role_pins : undefined, undefined);
+
+  const executorOnly = RunConfig.safeParse(rolePinBase({ role_pins: { "claude-code": "executor" } }));
+  assert.equal(executorOnly.success, true);
+  assert.deepEqual(executorOnly.success ? executorOnly.data.role_pins : undefined, { "claude-code": "executor" });
+
+  const reviewerOnly = RunConfig.safeParse(rolePinBase({ role_pins: { "codex-cli": "reviewer" } }));
+  assert.equal(reviewerOnly.success, true);
+  assert.deepEqual(reviewerOnly.success ? reviewerOnly.data.role_pins : undefined, { "codex-cli": "reviewer" });
+
+  const bothOpposite = RunConfig.safeParse(
+    rolePinBase({ role_pins: { "claude-code": "executor", "codex-cli": "reviewer" } }),
+  );
+  assert.equal(bothOpposite.success, true);
+});
+
+test("RunConfig.role_pins (z.enum) rejects a value outside {executor, reviewer}", () => {
+  const result = RunConfig.safeParse(rolePinBase({ role_pins: { "claude-code": "both" } }));
+  assert.equal(result.success, false);
+});
+
+test("RunConfig (RP1) rejects role_pins pinning every provider to reviewer -- no provider left eligible for the executor role", () => {
+  const result = RunConfig.safeParse(rolePinBase({ role_pins: { "claude-code": "reviewer", "codex-cli": "reviewer" } }));
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP1")));
+  }
+});
+
+test("RunConfig (RP2) rejects role_pins pinning every provider to executor -- no provider left eligible for the reviewer role", () => {
+  const result = RunConfig.safeParse(rolePinBase({ role_pins: { "claude-code": "executor", "codex-cli": "executor" } }));
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP2")));
+  }
+});
+
+test("RunConfig (RP3) rejects an explicit reviewer_provider naming a provider role_pins has pinned to executor", () => {
+  const result = RunConfig.safeParse(
+    rolePinBase({ reviewer_provider: "claude-code", role_pins: { "claude-code": "executor" } }),
+  );
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP3")));
+  }
+});
+
+test("RunConfig (RP4) rejects an explicit reviewer_provider disagreeing with the provider role_pins has pinned to reviewer", () => {
+  const result = RunConfig.safeParse(
+    rolePinBase({ reviewer_provider: "claude-code", role_pins: { "codex-cli": "reviewer" } }),
+  );
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP4")));
+  }
+});
+
+test("RunConfig accepts an explicit reviewer_provider that agrees with role_pins (RP3/RP4 both satisfied)", () => {
+  const result = RunConfig.safeParse(
+    rolePinBase({ reviewer_provider: "codex-cli", role_pins: { "codex-cli": "reviewer" } }),
+  );
+  assert.equal(result.success, true);
+});
+
+test("RunConfig (FM-P4/AC4) an RP1-triggering config never reaches runDispatch: safeParse fails before any turn or lock file", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const configPath = `${dir}/config.json`;
+    const config = rolePinBase({
+      run_id: RUN_ID,
+      repo_dir: dir,
+      role_pins: { "claude-code": "reviewer", "codex-cli": "reviewer" },
+    });
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+    await assert.rejects(
+      () => runRunCommand({ configPath, json: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.equal(err.exitCode, 2);
+        assert.ok(err.message.includes("RP1"));
+        return true;
+      },
+    );
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("RunConfig (FM-P4/AC5) an RP2-triggering config never reaches runDispatch: safeParse fails before any turn or lock file", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const configPath = `${dir}/config.json`;
+    const config = rolePinBase({
+      run_id: RUN_ID,
+      repo_dir: dir,
+      role_pins: { "claude-code": "executor", "codex-cli": "executor" },
+    });
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+    await assert.rejects(
+      () => runRunCommand({ configPath, json: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.equal(err.exitCode, 2);
+        assert.ok(err.message.includes("RP2"));
+        return true;
+      },
+    );
+  } finally {
+    await cleanup(dir);
+  }
+});
+
 test("runRunCommand dispatches a valid config and returns a RunReport whose exit_code passes through runDispatch's own result", async () => {
   // Drives runRunCommand through an injected fake `deps: RunDispatchDeps` -- a fake, always-healthy
   // preflight plus a fake AdapterRegistry/runProcessFn standing in for a real provider CLI, mirroring
@@ -464,6 +598,84 @@ test("runRunCommand dispatches a valid config and returns a RunReport whose exit
         [2, "reviewer", "claude-code", "completed", "CONTINUED", false],
       ],
     );
+    // §9 non-goal-adjacent guarantee (PHASE_7_SPEC.md §1.1): a config with no role_pins produces
+    // an empty warnings array in the JSON report, unaffected by this phase.
+    assert.deepStrictEqual(report.warnings, []);
+    RunReport.parse(report);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test("runRunCommand (AC3) surfaces reviewerReviewedOwnWork as a non-empty RunReport.warnings entry in the JSON report", async () => {
+  const dir = await freshRepoWithSpec();
+  try {
+    const configPath = `${dir}/config.json`;
+    const config = {
+      run_id: RUN_ID,
+      repo_dir: dir,
+      executor_providers: ["claude-code", "codex-cli"],
+      reviewer_provider: null,
+      turn_timeout_ms: 1_800_000,
+      phase: 1,
+      spec_path: "PHASE_1_SPEC.md",
+      baby_prd_path: "baby_prd.md",
+      context_path: "context.md",
+      is_final_phase: false,
+      // §6.1 worked table row 2: the naive reviewer default collapses onto executor_providers[1],
+      // which then reviews the diff it just wrote.
+      role_pins: { "claude-code": "executor" },
+    };
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+
+    const claude = new RecordingFakeAdapter("claude-code");
+    const codex = new RecordingFakeAdapter("codex-cli");
+    const adapters: AdapterRegistry = { "claude-code": claude, "codex-cli": codex };
+    const artifacts = await looprArtifactRefs(dir);
+
+    let call = 0;
+    const runProcessFn: typeof runProcess = async () => {
+      const step = call;
+      call += 1;
+      if (step === 0) {
+        await commitFile(dir, "foo.txt", "v1\n", "turn0");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 0, "executor", "claude-code"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec],
+            artifactsWritten: [{ path: "foo.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else if (step === 1) {
+        await commitFile(dir, "bar.txt", "v1\n", "turn1");
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 1, "executor", "codex-cli"),
+          draft({
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "foo.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "bar.txt", sha256: "a".repeat(64) }],
+          }),
+        );
+      } else {
+        await commitFile(dir, "PHASE_2_SPEC.md", "phase 2 spec content\n", "turn2");
+        const nextSpecSha256 = await sha256File(`${dir}/PHASE_2_SPEC.md`);
+        await writeHandoffRecord(
+          handoffPath(dir, RUN_ID, 1, 2, "reviewer", "codex-cli"),
+          draft({
+            role: "reviewer",
+            artifactsRead: [artifacts.babyPrd, artifacts.context, artifacts.spec, { path: "bar.txt", sha256: "a".repeat(64) }],
+            artifactsWritten: [{ path: "PHASE_2_SPEC.md", sha256: nextSpecSha256 }],
+          }),
+        );
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false };
+    };
+
+    const deps: RunDispatchDeps = { adapters, runProcessFn, preflightFn: fakeHealthyPreflight };
+    const { report } = await runRunCommand({ configPath, json: true }, deps);
+
+    assert.equal(report.ok, true);
+    assert.equal(report.warnings.length, 1);
+    assert.ok(report.warnings[0]?.includes("codex-cli"));
     RunReport.parse(report);
   } finally {
     await cleanup(dir);

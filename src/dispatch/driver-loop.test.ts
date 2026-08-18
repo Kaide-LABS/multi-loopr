@@ -37,11 +37,11 @@ function baseDriveConfig(dir: string, overrides: Partial<DriveConfig> = {}): Dri
 }
 
 function okResult(exitCode = 0): RunResult {
-  return { ok: true, exitCode, turns: [], halt: null, problems: [] };
+  return { ok: true, exitCode, turns: [], halt: null, problems: [], warnings: [] };
 }
 
 function errResult(exitCode: number, problems: readonly string[]): RunResult {
-  return { ok: false, exitCode, turns: [], halt: null, problems };
+  return { ok: false, exitCode, turns: [], halt: null, problems, warnings: [] };
 }
 
 test("runDrive (FM-D7) halts with DRIVER_START_INCOHERENT when BUILD_COMPLETE.md already exists before any dispatch, and dispatches nothing", async () => {
@@ -135,6 +135,52 @@ test("runDrive (baby_prd.md AC5, §8 AC11) walks a real 2-phase fixture build to
     // FM-D8: is_final_phase === phase >= target_total_phases, computed at exactly one call site.
     assert.equal(isFinalByPhase[1], false);
     assert.equal(isFinalByPhase[2], true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runDrive (PHASE_7_SPEC.md §6.4/FM-P5) threads role_pins unchanged into every dispatched phase's own RunConfig, across at least two consecutive phases", async () => {
+  const dir = await freshRepo();
+  try {
+    const rolePins = { "claude-code": "executor", "codex-cli": "reviewer" } as const;
+    const config = baseDriveConfig(dir, { target_total_phases: 3, role_pins: rolePins });
+    const seenRolePins: unknown[] = [];
+    const result = await runDrive(config, {
+      runDispatchFn: async (runConfig) => {
+        seenRolePins.push(runConfig.role_pins);
+        if (runConfig.phase < 3) {
+          await writeFile(`${dir}/PHASE_${String(runConfig.phase + 1)}_SPEC.md`, "next spec\n", "utf8");
+        } else {
+          await writeFile(`${dir}/BUILD_COMPLETE.md`, "done\n", "utf8");
+        }
+        return okResult();
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(seenRolePins.length, 3);
+    for (const seen of seenRolePins) {
+      assert.deepEqual(seen, rolePins);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runDrive (PHASE_7_SPEC.md §6.4) omits role_pins entirely from a dispatched phase's RunConfig when DriveConfig carries none", async () => {
+  const dir = await freshRepo();
+  try {
+    const config = baseDriveConfig(dir, { target_total_phases: 1 });
+    let dispatchedHasKey = true;
+    const result = await runDrive(config, {
+      runDispatchFn: async (runConfig) => {
+        dispatchedHasKey = Object.prototype.hasOwnProperty.call(runConfig, "role_pins");
+        await writeFile(`${dir}/BUILD_COMPLETE.md`, "done\n", "utf8");
+        return okResult();
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(dispatchedHasKey, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

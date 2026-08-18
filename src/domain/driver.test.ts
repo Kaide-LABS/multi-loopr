@@ -80,6 +80,67 @@ test("DriveConfig rejects an unsafe starting_spec_path (absolute path)", () => {
   assert.equal(DriveConfig.safeParse(raw).success, false);
 });
 
+// -------------------------------------------------------------------------------------------
+// PHASE_7_SPEC.md §3.2/§3.3 -- DriveConfig.role_pins round-trip and RP1-RP4 rejections, identical
+// in shape to RunConfig's own new cases (src/cli/run.test.ts).
+// -------------------------------------------------------------------------------------------
+
+test("DriveConfig.role_pins round-trips every valid pin combination and is absent by default", () => {
+  const omitted = DriveConfig.safeParse(validDriveConfig());
+  assert.equal(omitted.success, true);
+  assert.equal(omitted.success ? omitted.data.role_pins : undefined, undefined);
+
+  const executorOnly = DriveConfig.safeParse(validDriveConfig({ role_pins: { "claude-code": "executor" } }));
+  assert.equal(executorOnly.success, true);
+  assert.deepEqual(executorOnly.success ? executorOnly.data.role_pins : undefined, { "claude-code": "executor" });
+
+  const bothOpposite = DriveConfig.safeParse(
+    validDriveConfig({ role_pins: { "claude-code": "executor", "codex-cli": "reviewer" } }),
+  );
+  assert.equal(bothOpposite.success, true);
+});
+
+test("DriveConfig.role_pins (z.enum) rejects a value outside {executor, reviewer}", () => {
+  const result = DriveConfig.safeParse(validDriveConfig({ role_pins: { "claude-code": "both" } }));
+  assert.equal(result.success, false);
+});
+
+test("DriveConfig (RP1) rejects role_pins pinning every provider to reviewer", () => {
+  const result = DriveConfig.safeParse(validDriveConfig({ role_pins: { "claude-code": "reviewer", "codex-cli": "reviewer" } }));
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP1")));
+  }
+});
+
+test("DriveConfig (RP2) rejects role_pins pinning every provider to executor", () => {
+  const result = DriveConfig.safeParse(validDriveConfig({ role_pins: { "claude-code": "executor", "codex-cli": "executor" } }));
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP2")));
+  }
+});
+
+test("DriveConfig (RP3) rejects an explicit reviewer_provider naming a provider role_pins has pinned to executor", () => {
+  const result = DriveConfig.safeParse(
+    validDriveConfig({ reviewer_provider: "claude-code", role_pins: { "claude-code": "executor" } }),
+  );
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP3")));
+  }
+});
+
+test("DriveConfig (RP4) rejects an explicit reviewer_provider disagreeing with the provider role_pins has pinned to reviewer", () => {
+  const result = DriveConfig.safeParse(
+    validDriveConfig({ reviewer_provider: "claude-code", role_pins: { "codex-cli": "reviewer" } }),
+  );
+  assert.equal(result.success, false);
+  if (!result.success) {
+    assert.ok(result.error.issues.some((i) => i.message.includes("RP4")));
+  }
+});
+
 test("DRIVER_STATE_IDS has exactly six members", () => {
   assert.equal(DRIVER_STATE_IDS.length, 6);
 });

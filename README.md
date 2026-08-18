@@ -8,7 +8,14 @@ to the other so the second genuinely continues the first's work.
 
 A `multi-loopr run --config <path>` command dispatches one loopr phase's sequential turn sequence.
 `run` mechanically enforces that every turn genuinely references loopr's own `baby_prd.md`/
-`context.md`/phase spec, and that the reviewer turn genuinely produces the next loopr artifact.
+`context.md`/phase spec, and that the reviewer turn genuinely produces the next loopr artifact. By
+default, the two configured providers alternate through the executor and reviewer roles, with the
+reviewer defaulting to whichever provider did not produce the diff under review. An operator may
+instead pin either provider exclusively to the executor role or exclusively to the reviewer role
+via the run config's `role_pins` field, producing clean single-role separation instead of the
+default alternation; an impossible pinning is rejected before any turn is dispatched, and a pinning
+that would force a reviewer to review its own prior work is surfaced plainly in the run's own
+output rather than silently proceeding.
 `multi-loopr evidence --repo-dir <path> --run-id <uuid>` independently re-derives PRD AC1 (continuity),
 AC2 (clean completion), and AC3 (artifact reference and production) from a completed run's own
 persisted handoff records, offline and without trusting anything the run itself reported live.
