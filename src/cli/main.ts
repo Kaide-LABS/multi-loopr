@@ -406,8 +406,79 @@ function renderDriveHumanReport(report: DriveReport): string {
   return lines.join("\n") + "\n";
 }
 
-/** Parses `argv`, dispatches the requested command, and returns the process exit code. Never calls `process.exit`. */
+/**
+ * Sentinel used by {@link emitOptionalResearchNoteThenExit}'s internal race to detect "the probe has
+ * not settled yet" without a fixed grace timeout -- see that function's doc comment.
+ */
+const NOTE_NOT_YET_SETTLED = Symbol("note-not-yet-settled");
+
+/**
+ * Writes `text` to `stream` and resolves only once the underlying write is actually flushed (Node's
+ * write callback), never merely queued. Used immediately before {@link emitOptionalResearchNoteThenExit}
+ * forces `process.exit()`, so a forced exit can never race ahead of -- and truncate -- output that was
+ * already handed to `stream.write()`.
+ */
+function writeFlushed(stream: NodeJS.WritableStream, text: string): Promise<void> {
+  return new Promise((resolve) => {
+    stream.write(text, () => resolve());
+  });
+}
+
+/**
+ * Finishes the `run`/`drive` commands' optional-research-server note (PHASE_9_SPEC.md §6.7) and then
+ * terminates the process -- the one narrow, documented exception to "never calls `process.exit`"
+ * (see {@link main}'s own doc comment).
+ *
+ * Why this exists (Phase 9 review regression, fixed by this patch): `notePromise` is
+ * `probeOptionalResearchServers()`'s result, kicked off in parallel with the command's own real work
+ * so that for a genuine multi-minute `run`/`drive` invocation it has always resolved by the time the
+ * primary report is ready -- exactly PHASE_9_SPEC.md §6.7's "zero added latency, by construction"
+ * intent. That premise is false on any *fast* exit path (a `RunConfig`/`DriveConfig` validation
+ * error, a usage error, an early preflight failure): those return in milliseconds, long before the
+ * two concurrent `claude mcp get` calls underneath the probe do. Simply not `await`ing `notePromise`
+ * before returning does NOT fix that: Node keeps the OS process alive until every open handle clears
+ * -- including a still-running child process's stdio pipes -- regardless of whether any JS code is
+ * still `await`ing its promise. The only way to make the *process* (not just this function) return
+ * immediately is to force it with `process.exit()` once this command's own output is fully flushed.
+ *
+ * The race below has no fixed grace period (a several-second compromise would just reintroduce a
+ * smaller version of the same bug): `Promise.resolve(NOTE_NOT_YET_SETTLED)` settles on the very next
+ * microtask, so if `notePromise` had already resolved by the time we get here -- true for every
+ * genuine slow run, since its underlying I/O long since fired -- `Promise.race` picks up its real
+ * value (array order: `notePromise` is listed first, so an already-settled `notePromise` wins ties).
+ * If `notePromise` has not yet settled, the sentinel wins with no added wait, and the note is simply
+ * dropped for this invocation -- acceptable because it is advisory-only (§6.7: "nothing in this run
+ * was skipped or degraded because of them").
+ */
+async function emitOptionalResearchNoteThenExit(
+  notePromise: ReturnType<typeof probeOptionalResearchServers>,
+  exitCode: number,
+): Promise<never> {
+  const raced = await Promise.race([notePromise, Promise.resolve(NOTE_NOT_YET_SETTLED)]);
+  if (raced !== NOTE_NOT_YET_SETTLED) {
+    const note = renderOptionalResearchNote(raced);
+    if (note !== null) {
+      await writeFlushed(process.stderr, note);
+    }
+  }
+  process.exit(exitCode);
+}
+
+/**
+ * Parses `argv`, dispatches the requested command, and returns the process exit code. Never calls
+ * `process.exit`, with one narrow, documented exception: `run`/`drive` end by calling
+ * {@link emitOptionalResearchNoteThenExit}, which forces an immediate `process.exit()` after their
+ * own output is flushed, so a still-in-flight optional-research-server probe can never hold the real
+ * OS process open on a fast exit path. See that function's doc comment for why a plain `await` (or
+ * simply not awaiting) cannot achieve this on its own.
+ */
 export async function main(argv: readonly string[]): Promise<number> {
+  // Hoisted out of the `run`/`drive` case blocks so the `catch` below can also race+exit it: a
+  // `RunConfig`/`DriveConfig` validation failure (or any other usage/preflight error) throws a
+  // `MultiLooprError` from `runRunCommand`/`runDriveCommand` *before* the case block's own
+  // `emitOptionalResearchNoteThenExit` call is ever reached, so that call alone does not cover the
+  // fast-fail path this patch exists to fix -- the `catch` block needs the same treatment.
+  let notePromiseForExit: ReturnType<typeof probeOptionalResearchServers> | null = null;
   try {
     const command = parseArgs(argv);
     switch (command.kind) {
@@ -426,13 +497,10 @@ export async function main(argv: readonly string[]): Promise<number> {
       }
       case "run": {
         const notePromise = probeOptionalResearchServers();
+        notePromiseForExit = notePromise;
         const { report, exitCode } = await runRunCommand({ configPath: command.configPath, json: command.json });
-        process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderRunHumanReport(report));
-        const note = renderOptionalResearchNote(await notePromise);
-        if (note !== null) {
-          process.stderr.write(note);
-        }
-        return exitCode;
+        await writeFlushed(process.stdout, command.json ? JSON.stringify(report, null, 2) + "\n" : renderRunHumanReport(report));
+        return await emitOptionalResearchNoteThenExit(notePromise, exitCode);
       }
       case "evidence": {
         const { report, exitCode } = await runEvidenceCommand({
@@ -446,13 +514,10 @@ export async function main(argv: readonly string[]): Promise<number> {
       }
       case "drive": {
         const notePromise = probeOptionalResearchServers();
+        notePromiseForExit = notePromise;
         const { report, exitCode } = await runDriveCommand({ configPath: command.configPath, json: command.json });
-        process.stdout.write(command.json ? JSON.stringify(report, null, 2) + "\n" : renderDriveHumanReport(report));
-        const note = renderOptionalResearchNote(await notePromise);
-        if (note !== null) {
-          process.stderr.write(note);
-        }
-        return exitCode;
+        await writeFlushed(process.stdout, command.json ? JSON.stringify(report, null, 2) + "\n" : renderDriveHumanReport(report));
+        return await emitOptionalResearchNoteThenExit(notePromise, exitCode);
       }
       case "mcp": {
         await runMcpServer();
@@ -470,12 +535,21 @@ export async function main(argv: readonly string[]): Promise<number> {
     // Exhaustive per the Command union above; unreachable, but satisfies noImplicitReturns.
     throw new InternalError("Unreachable: unknown command kind.");
   } catch (err) {
-    if (err instanceof MultiLooprError) {
-      process.stderr.write(`${err.message}\n`);
-      return err.exitCode;
+    const exitCode = err instanceof MultiLooprError ? err.exitCode : ExitCode.INTERNAL;
+    const message =
+      err instanceof MultiLooprError
+        ? `${err.message}\n`
+        : `${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`;
+    await writeFlushed(process.stderr, message);
+    // A `run`/`drive` invocation that threw before reaching its own `emitOptionalResearchNoteThenExit`
+    // call (e.g. a fast `RunConfig`/`DriveConfig` validation error) still owns a live `notePromise` --
+    // give it the exact same race-then-force-exit treatment so this path is not slower than the
+    // success path it fixes. Every other command leaves `notePromiseForExit` `null` and returns
+    // normally, unchanged from before this patch.
+    if (notePromiseForExit !== null) {
+      return await emitOptionalResearchNoteThenExit(notePromiseForExit, exitCode);
     }
-    process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
-    return ExitCode.INTERNAL;
+    return exitCode;
   }
 }
 
