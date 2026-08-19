@@ -94,21 +94,50 @@
 <body>
   <h1>multi-loopr</h1>
   <p class="subtitle">
-    Two independent AI coding assistants build the same piece of software, under one plan, with
-    one checking the other's work as a genuinely separate reader.
+    Two independent AI coding providers build the same piece of software under one plan, with one
+    checking the other's work as a genuinely separate reader &mdash; driven from inside whatever
+    agent you're already working in, over MCP.
   </p>
 
+  <h2>The interface is MCP</h2>
+  <p>
+    multi-loopr runs as a Model Context Protocol server. Connect it to any MCP-capable client and
+    it exposes four tools &mdash; <code>run</code>, <code>drive</code>, <code>doctor</code>,
+    <code>evidence</code> &mdash; so you drive a spec-disciplined, cross-provider build
+    conversationally, from inside your own agent, without hand-writing a config file or leaving the
+    session you're already in. The same four operations are also a plain CLI, if that's what you'd
+    rather script against.
+  </p>
+
+  <h2>The discipline, before either provider writes anything</h2>
+  <p>
+    Before any code exists, the plan goes through <strong>loopr</strong>, the spec-discipline layer
+    this tool runs on: an interrogation against a six-part stopping test &mdash; does the plan name
+    a real outcome, is it independently checkable, are its edges named, is its boundary confirmed,
+    is there real context worth keeping, are there no unresolved unknowns. A human confirms the
+    resulting spec before anything is built.
+  </p>
+
+  <h2>The runtime, once building starts</h2>
+  <p>
+    multi-loopr hands each phase between two independently-configured providers: one implements,
+    the other reviews. The reviewer defaults to whichever provider did not write the diff under
+    review, so the check is a second, separate read of the work &mdash; not the same model
+    re-reading its own reasoning. Nothing in the core cares <em>which</em> providers those are; each
+    is a thin adapter behind the same interface, which is what makes the reviewer's role real in
+    the first place &mdash; the architecture doesn't know or reward one provider agreeing with
+    itself.
+  </p>
+  <p>
+    An operator can pin either provider to a fixed role instead of the default alternation. An
+    impossible pinning is rejected before any turn runs. A pinning that would force a provider to
+    review its own prior work is surfaced plainly, as a warning, rather than allowed to pass
+    unnoticed.
+  </p>
   <p class="thesis">
-    Before either assistant writes a line of code, the plan goes through <strong>loopr</strong>, the
-    spec-discipline layer this tool runs: an interrogation against a six-part stopping test &mdash;
-    does the plan name a real outcome, is it independently checkable, are its edges named, is its
-    boundary confirmed, is there real context worth keeping, are there no unresolved unknowns. A
-    human confirms the resulting spec before anything is built. Once building starts, multi-loopr
-    hands each phase between two independent providers: one implements, the other reviews. The
-    reviewer defaults to whichever provider did not write the diff under review, so the check is a
-    second, separate read of the work &mdash; not the same model re-reading its own reasoning. An
-    operator can pin either provider to a fixed role; if a pinning would force a provider to review
-    its own prior work, multi-loopr surfaces that plainly rather than letting it pass unnoticed.
+    <strong>Wired up today: Claude Code and Codex CLI.</strong> That's an adapter count, not an
+    architectural ceiling &mdash; adding a third provider is a new adapter behind the existing
+    interface, not a redesign.
   </p>
 
   <h2>What it does today</h2>
@@ -133,14 +162,8 @@
     <div class="card">
       <h3><code>multi-loopr evidence</code></h3>
       <p>Independently re-derives whether a completed run actually met its own completion criteria,
-      from the run's persisted handoff records, offline &mdash; without trusting what the run reported
-      live.</p>
-    </div>
-    <div class="card">
-      <h3><code>multi-loopr mcp</code></h3>
-      <p>Exposes <code>run</code>, <code>drive</code>, <code>doctor</code>, and <code>evidence</code>
-      as Model Context Protocol tools over stdio, so any MCP-capable client can drive a build
-      conversationally without hand-writing a config file.</p>
+      from the run's persisted handoff records, offline &mdash; without trusting what the run
+      reported live.</p>
     </div>
     <div class="card">
       <h3><code>multi-loopr setup</code></h3>
@@ -150,16 +173,11 @@
     </div>
   </div>
 
-  <p class="thesis">
-    The provider set today is exactly two: <strong>Claude Code</strong> and <strong>Codex
-    CLI</strong>.
-  </p>
-
   <h2>How to try it</h2>
   <p>
     multi-loopr is MIT-licensed and published on npm. It runs entirely on your own machine, using
-    your own Claude Code and Codex CLI credentials &mdash; there is no hosted account and no service
-    multi-loopr operates on your behalf.
+    your own Claude Code and Codex CLI credentials &mdash; there is no hosted account and no
+    service multi-loopr operates on your behalf.
   </p>
   <pre><code>npm install -g multi-loopr
 multi-loopr doctor</code></pre>
@@ -171,9 +189,9 @@ multi-loopr doctor</code></pre>
   <h2>Proof</h2>
   <div class="proof">
     <p>
-      <strong>Sand-FDE-App</strong> is a real, public build carried out under this same
-      spec-discipline process &mdash; two unsolicited technical artifacts for Sand Technologies,
-      with their methodology and every disclosed judgment call published alongside the work.
+      Sand-FDE-App is a real, public build carried out under this same spec-discipline process
+      &mdash; two unsolicited technical artifacts for Sand Technologies, with their methodology and
+      every disclosed judgment call published alongside the work.
     </p>
     <a href="https://kaide-labs.github.io/Sand-FDE-App/">View Sand-FDE-App &rarr;</a>
   </div>
@@ -181,7 +199,7 @@ multi-loopr doctor</code></pre>
   <h2>Get in touch</h2>
   <p>
     If you're evaluating this or want a walkthrough, reach out &mdash;
-    <a href="mailto:schoolbalogun@gmail.com">schoolbalogun@gmail.com</a>.
+    <a href="mailto:hafeedh.balogun@gmail.com">hafeedh.balogun@gmail.com</a>.
   </p>
 
   <footer>
