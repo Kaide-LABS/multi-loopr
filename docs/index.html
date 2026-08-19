@@ -94,9 +94,36 @@
 <body>
   <h1>multi-loopr</h1>
   <p class="subtitle">
-    Two independent AI coding providers build the same piece of software under one plan, with one
-    checking the other's work as a genuinely separate reader &mdash; driven from inside whatever
-    agent you're already working in, over MCP.
+    Bring your own agent. No new subscription, no new credentials &mdash; multi-loopr coordinates
+    the Claude Code and Codex CLI access you already have.
+  </p>
+
+  <h2>Bring your own agent</h2>
+  <p>
+    multi-loopr runs on the provider access you already pay for. It never proxies or resells a
+    provider's API, and it never asks you to sign into anything of its own &mdash; there is no
+    multi-loopr account. This isn't a claim to take on faith: multi-loopr makes zero network calls
+    anywhere in its own source, mechanically enforced by its own boundary scan on every change, not
+    just stated as intent. It never triggers a provider's credential-setup flow either &mdash; the
+    one place it touches auth at all is to check whether you're already signed in, the same way
+    <code>doctor</code> reports on the rest of your toolchain. You already have Claude Code and
+    Codex CLI. multi-loopr coordinates them; it doesn't ask you to buy anything else.
+  </p>
+
+  <h2>So how does the handoff not fall apart?</h2>
+  <p>
+    The obvious worry with two providers on one build: provider A does some work, hands off to
+    provider B, and B either redoes it or ignores it because it never really understood what A did.
+    Two things prevent that. Before any code exists, the plan is interrogated against a six-part
+    stopping test and a human confirms the resulting spec &mdash; both providers read that same
+    confirmed spec directly off disk, not a paraphrase of it. Then, what actually crosses the
+    handoff between phases isn't a summary multi-loopr keeps in memory: it's a structured record of
+    git ground truth plus which files were genuinely read and written, hashed to prove it &mdash;
+    with an active check that strips out anything resembling the previous provider's own reasoning
+    or conversation, so the next turn inherits the verified result, never an unverified account of
+    it. <code>multi-loopr drive</code> then walks every later phase unattended the same way,
+    deciding after each one from what's actually on disk, not a remembered state. Unattended once
+    running. Human-confirmed before it starts.
   </p>
 
   <h2>The interface is MCP</h2>
