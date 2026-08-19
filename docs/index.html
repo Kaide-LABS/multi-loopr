@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multi-loopr</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --border: #e2e2e2;
+    --accent: #2f6f4f;
+    --card-bg: #f7f7f5;
+    --code-bg: #f0efe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212;
+      --fg: #e8e8e8;
+      --muted: #a3a3a3;
+      --border: #2c2c2c;
+      --accent: #6fbf94;
+      --card-bg: #1b1b1b;
+      --code-bg: #1e1e1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 4rem;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.1rem; margin: 2.25rem 0 0.75rem; }
+  .subtitle { color: var(--muted); margin-top: 0; margin-bottom: 2rem; }
+  p { color: var(--fg); }
+  .thesis { color: var(--muted); }
+  code {
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 0.1rem 0.35rem;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+    overflow-x: auto;
+    font-size: 0.88rem;
+  }
+  pre code { background: none; padding: 0; }
+  ul { padding-left: 1.1rem; }
+  li { margin-bottom: 0.5rem; }
+  .cards { display: flex; flex-direction: column; gap: 1rem; margin: 1.25rem 0; }
+  .card {
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    border-radius: 10px;
+    padding: 1.1rem 1.4rem;
+  }
+  .card h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+  .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+  .card code { font-size: 0.85em; }
+  .proof {
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin: 1.25rem 0;
+  }
+  .proof p { margin: 0 0 0.9rem; color: var(--muted); font-size: 0.95rem; }
+  .proof a {
+    display: inline-block;
+    color: var(--accent);
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.9rem;
+  }
+  .proof a:hover { text-decoration: underline; }
+  a { color: var(--accent); }
+  footer { margin-top: 2.5rem; font-size: 0.85rem; color: var(--muted); }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>multi-loopr</h1>
+  <p class="subtitle">
+    Two independent AI coding assistants build the same piece of software, under one plan, with
+    one checking the other's work as a genuinely separate reader.
+  </p>
+
+  <p class="thesis">
+    Before either assistant writes a line of code, the plan goes through <strong>loopr</strong>, the
+    spec-discipline layer this tool runs: an interrogation against a six-part stopping test &mdash;
+    does the plan name a real outcome, is it independently checkable, are its edges named, is its
+    boundary confirmed, is there real context worth keeping, are there no unresolved unknowns. A
+    human confirms the resulting spec before anything is built. Once building starts, multi-loopr
+    hands each phase between two independent providers: one implements, the other reviews. The
+    reviewer defaults to whichever provider did not write the diff under review, so the check is a
+    second, separate read of the work &mdash; not the same model re-reading its own reasoning. An
+    operator can pin either provider to a fixed role; if a pinning would force a provider to review
+    its own prior work, multi-loopr surfaces that plainly rather than letting it pass unnoticed.
+  </p>
+
+  <h2>What it does today</h2>
+  <div class="cards">
+    <div class="card">
+      <h3><code>multi-loopr run</code></h3>
+      <p>Dispatches one phase's turn sequence between the two configured providers, and mechanically
+      checks that every turn genuinely references the phase's own spec and prior handoff record.</p>
+    </div>
+    <div class="card">
+      <h3><code>multi-loopr drive</code></h3>
+      <p>Walks a build through every phase of a target project unattended: after each phase, it
+      decides &mdash; from the real state on disk &mdash; whether to dispatch the next phase, stop
+      cleanly, or halt on an incoherent state, and logs every decision.</p>
+    </div>
+    <div class="card">
+      <h3>Role pinning</h3>
+      <p>Pin either provider exclusively to the executor role or exclusively to the reviewer role,
+      instead of the default alternation. An impossible pinning is rejected before any turn runs; a
+      pinning that would force self-review is surfaced as a warning, never silently allowed.</p>
+    </div>
+    <div class="card">
+      <h3><code>multi-loopr evidence</code></h3>
+      <p>Independently re-derives whether a completed run actually met its own completion criteria,
+      from the run's persisted handoff records, offline &mdash; without trusting what the run reported
+      live.</p>
+    </div>
+    <div class="card">
+      <h3><code>multi-loopr mcp</code></h3>
+      <p>Exposes <code>run</code>, <code>drive</code>, <code>doctor</code>, and <code>evidence</code>
+      as Model Context Protocol tools over stdio, so any MCP-capable client can drive a build
+      conversationally without hand-writing a config file.</p>
+    </div>
+    <div class="card">
+      <h3><code>multi-loopr setup</code></h3>
+      <p>Registers multi-loopr's own MCP server plus two optional research servers (arXiv,
+      paper-search) in one command. Both are optional &mdash; nothing about multi-loopr requires
+      them.</p>
+    </div>
+  </div>
+
+  <p class="thesis">
+    The provider set today is exactly two: <strong>Claude Code</strong> and <strong>Codex
+    CLI</strong>.
+  </p>
+
+  <h2>How to try it</h2>
+  <p>
+    multi-loopr is MIT-licensed and published on npm. It runs entirely on your own machine, using
+    your own Claude Code and Codex CLI credentials &mdash; there is no hosted account and no service
+    multi-loopr operates on your behalf.
+  </p>
+  <pre><code>npm install -g multi-loopr
+multi-loopr doctor</code></pre>
+  <p>
+    <code>doctor</code> checks your toolchain and both provider CLIs before you run anything. Full
+    usage is in the <a href="https://github.com/Kaide-LABS/multi-loopr">README</a>.
+  </p>
+
+  <h2>Proof</h2>
+  <div class="proof">
+    <p>
+      <strong>Sand-FDE-App</strong> is a real, public build carried out under this same
+      spec-discipline process &mdash; two unsolicited technical artifacts for Sand Technologies,
+      with their methodology and every disclosed judgment call published alongside the work.
+    </p>
+    <a href="https://kaide-labs.github.io/Sand-FDE-App/">View Sand-FDE-App &rarr;</a>
+  </div>
+
+  <h2>Get in touch</h2>
+  <p>
+    If you're evaluating this or want a walkthrough, reach out &mdash;
+    <a href="mailto:schoolbalogun@gmail.com">schoolbalogun@gmail.com</a>.
+  </p>
+
+  <footer>
+    Source, the full build history, and every disclosed limitation are in the
+    <a href="https://github.com/Kaide-LABS/multi-loopr">GitHub repository</a>.
+  </footer>
+</body>
+</html>
