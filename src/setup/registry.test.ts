@@ -12,6 +12,7 @@ import { SETUP_SERVER_IDS, SETUP_OUTCOMES } from "../domain/setup.ts";
 import { SETUP_SERVERS, resolveServerLaunch } from "./servers.ts";
 import type { LauncherProbeFacts } from "./servers.ts";
 import {
+  MCP_ADD_ALREADY_EXISTS_MARKER,
   buildMcpAddArgs,
   buildMcpGetArgs,
   decideServerOutcome,
@@ -89,11 +90,21 @@ test("interpretMcpGetResult: exit 0 -> present, exit 1 -> absent, timeout/other 
   assert.equal(interpretMcpGetResult(fakeResult({ exitCode: null })), "indeterminate");
 });
 
-test("interpretMcpAddResult: exit 0 -> ok, timeout -> indeterminate, otherwise -> failed", () => {
+test("interpretMcpAddResult: exit 0 -> ok, timeout -> indeterminate, non-zero with the marker -> already-exists, otherwise -> failed", () => {
   assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 0 })), "ok");
   assert.equal(interpretMcpAddResult(fakeResult({ timedOut: true })), "indeterminate");
   assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 1 })), "failed");
   assert.equal(interpretMcpAddResult(fakeResult({ exitCode: null })), "failed");
+  assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 1, stderr: "MCP server multi-loopr already exists in user config" })), "already-exists");
+  assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 1, stderr: MCP_ADD_ALREADY_EXISTS_MARKER })), "already-exists");
+});
+
+test("regression: a genuine non-duplicate add failure (verified live against the real CLI) is 'failed', not 'already-exists' -- exit code alone is not a safe signal", () => {
+  // Verified live: `claude mcp add --scope user "bad name" -- node x.js` and
+  // `claude mcp add --scope user emptycmdtest --` both exit 1 with stderr that does NOT contain
+  // "already exists in user config".
+  assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 1, stderr: "Invalid name bad name. Names can only contain letters, numbers, hyphens, and underscores." })), "failed");
+  assert.equal(interpretMcpAddResult(fakeResult({ exitCode: 1, stderr: "error: missing required argument 'commandOrUrl'" })), "failed");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -101,32 +112,28 @@ test("interpretMcpAddResult: exit 0 -> ok, timeout -> indeterminate, otherwise -
 // ---------------------------------------------------------------------------------------------
 
 test("AC-D1: decideServerOutcome's minimum-required table rows all hold", () => {
-  assert.equal(decideServerOutcome("present", "not-attempted", "not-attempted"), "already-registered");
-  assert.equal(decideServerOutcome("indeterminate", "not-attempted", "not-attempted"), "indeterminate");
-  assert.equal(decideServerOutcome("absent", "ok", "present"), "registered");
-  assert.equal(decideServerOutcome("absent", "ok", "absent"), "registered-unverified");
-  assert.equal(decideServerOutcome("absent", "ok", "indeterminate"), "registered-unverified");
-  assert.equal(decideServerOutcome("absent", "failed", "not-attempted"), "failed");
-  assert.equal(decideServerOutcome("absent", "indeterminate", "not-attempted"), "indeterminate");
+  assert.equal(decideServerOutcome("already-exists", "not-attempted"), "already-registered");
+  assert.equal(decideServerOutcome("ok", "present"), "registered");
+  assert.equal(decideServerOutcome("ok", "absent"), "registered-unverified");
+  assert.equal(decideServerOutcome("ok", "indeterminate"), "registered-unverified");
+  assert.equal(decideServerOutcome("failed", "not-attempted"), "failed");
+  assert.equal(decideServerOutcome("indeterminate", "not-attempted"), "indeterminate");
 });
 
-test("decideServerOutcome is total over every reachable (pre, add, post) combination and always returns a valid SetupOutcome", () => {
-  const preValues: OptionalServerState[] = ["present", "absent", "indeterminate"];
-  const addValues: Array<"ok" | "failed" | "indeterminate" | "not-attempted"> = ["ok", "failed", "indeterminate", "not-attempted"];
+test("decideServerOutcome is total over every reachable (add, post) combination and always returns a valid SetupOutcome", () => {
+  const addValues: Array<"ok" | "already-exists" | "failed" | "indeterminate"> = ["ok", "already-exists", "failed", "indeterminate"];
   const postValues: Array<OptionalServerState | "not-attempted"> = ["present", "absent", "indeterminate", "not-attempted"];
-  for (const pre of preValues) {
-    for (const add of addValues) {
-      for (const post of postValues) {
-        const outcome = decideServerOutcome(pre, add, post);
-        assert.ok((SETUP_OUTCOMES as readonly string[]).includes(outcome), `unexpected outcome ${outcome} for (${pre},${add},${post})`);
-      }
+  for (const add of addValues) {
+    for (const post of postValues) {
+      const outcome = decideServerOutcome(add, post);
+      assert.ok((SETUP_OUTCOMES as readonly string[]).includes(outcome), `unexpected outcome ${outcome} for (${add},${post})`);
     }
   }
 });
 
 test("FM-I1: registered and registered-unverified are genuinely distinct outcomes", () => {
-  const registered = decideServerOutcome("absent", "ok", "present");
-  const unverified = decideServerOutcome("absent", "ok", "absent");
+  const registered = decideServerOutcome("ok", "present");
+  const unverified = decideServerOutcome("ok", "absent");
   assert.equal(registered, "registered");
   assert.equal(unverified, "registered-unverified");
   assert.notEqual(registered, unverified);

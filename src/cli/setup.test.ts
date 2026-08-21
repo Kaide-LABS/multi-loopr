@@ -21,21 +21,17 @@ function fakeResult(overrides: Partial<RawInvocationResult> = {}): RawInvocation
   return { exitCode: 0, signal: null, stdout: "", stderr: "", durationMs: 1, timedOut: false, ...overrides };
 }
 
-test("AC1-a: one setup run configures all three servers -- exact 9-call argv sequence, all registered", async () => {
-  // Pre-check must report absent (exit 1) for add to be attempted; post-check must report present.
-  // We need per-call sequencing: 1st get (pre) -> 1, 2nd get (post) -> 0.
-  const getCallCounts = new Map<string, number>();
+test("AC1-a: one setup run configures all three servers -- exact 6-call argv sequence, all registered", async () => {
+  // No pre-check anymore: add is attempted directly, and only a successful add is followed by a
+  // post-check get. All three adds succeed (exit 0) and all three post-checks report present.
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
     const sub = o.args[1];
-    if (sub === "get") {
-      const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
-    }
     if (sub === "add") {
+      return fakeResult({ exitCode: 0 });
+    }
+    if (sub === "get") {
       return fakeResult({ exitCode: 0 });
     }
     return fakeResult({ exitCode: 1 });
@@ -71,12 +67,11 @@ test("AC1-a: one setup run configures all three servers -- exact 9-call argv seq
   const expectedNames = ["multi-loopr", "arxiv-mcp", "paper-search-mcp"];
   let i = 0;
   for (const name of expectedNames) {
-    assert.ok(claudeArgvs[i]?.startsWith(`mcp get ${name}`), `expected pre-check get for ${name}, got ${claudeArgvs[i]}`);
-    assert.ok(claudeArgvs[i + 1]?.startsWith(`mcp add --scope user --transport stdio ${name} --`), `expected add for ${name}, got ${claudeArgvs[i + 1]}`);
-    assert.ok(claudeArgvs[i + 2]?.startsWith(`mcp get ${name}`), `expected post-check get for ${name}, got ${claudeArgvs[i + 2]}`);
-    i += 3;
+    assert.ok(claudeArgvs[i]?.startsWith(`mcp add --scope user --transport stdio ${name} --`), `expected add for ${name}, got ${claudeArgvs[i]}`);
+    assert.ok(claudeArgvs[i + 1]?.startsWith(`mcp get ${name}`), `expected post-check get for ${name}, got ${claudeArgvs[i + 1]}`);
+    i += 2;
   }
-  assert.equal(claudeArgvs.length, 9); // 3 servers x (pre-check, add, post-check)
+  assert.equal(claudeArgvs.length, 6); // 3 servers x (add, post-check)
 });
 
 test("AC1-b: multi-loopr's command/args reflect nodeOnPath true/false", async () => {
@@ -84,8 +79,8 @@ test("AC1-b: multi-loopr's command/args reflect nodeOnPath true/false", async ()
     const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
       if (o.command === "uvx") return fakeResult({ exitCode: 1 });
       if (o.command === "node") return fakeResult({ exitCode: nodeExitCode });
-      if (o.args[1] === "get") return fakeResult({ exitCode: 1 }); // always absent -> add attempted
       if (o.args[1] === "add") return fakeResult({ exitCode: 0 });
+      if (o.args[1] === "get") return fakeResult({ exitCode: 0 });
       return fakeResult({ exitCode: 1 });
     };
     const { report } = await runSetupCommand(
@@ -119,16 +114,10 @@ test("AC1-c precondition: skipped-no-agent-cli when claude CLI is not found -- a
 });
 
 test("AC2-a: an isolated arxiv-mcp add failure is named, and the other two still register; exit_code is OK", async () => {
-  const getCallCounts = new Map<string, number>();
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
-    if (o.args[1] === "get") {
-      const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
-    }
+    if (o.args[1] === "get") return fakeResult({ exitCode: 0 });
     if (o.args[1] === "add") {
       const name = o.args[6] as string;
       if (name === "arxiv-mcp") return fakeResult({ exitCode: 1, stderr: "distinctive-arxiv-failure" });
@@ -157,17 +146,11 @@ test("AC2-a: an isolated arxiv-mcp add failure is named, and the other two still
 });
 
 test("AC2-b: a multi-loopr add failure is fatal (exit SETUP_FAILED), but both optional servers were still attempted and registered", async () => {
-  const getCallCounts = new Map<string, number>();
   const addCalls: string[] = [];
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
-    if (o.args[1] === "get") {
-      const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
-    }
+    if (o.args[1] === "get") return fakeResult({ exitCode: 0 });
     if (o.args[1] === "add") {
       const name = o.args[6] as string;
       addCalls.push(name);
@@ -212,19 +195,16 @@ test("AC2-c (FM-I7): computeSetupExitCode reads only the multi-loopr outcome, ne
 });
 
 test("AC2-d (FM-I1): multi-loopr add ok but post-add get fails -> registered-unverified, exit SETUP_FAILED, distinct rendering", async () => {
-  const getCallCounts = new Map<string, number>();
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
     if (o.args[1] === "get") {
       const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
       if (name === "multi-loopr") {
-        // pre-check absent (idx 0), post-check also fails (idx 1)
+        // post-add get fails to confirm.
         return fakeResult({ exitCode: 1 });
       }
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
+      return fakeResult({ exitCode: 0 });
     }
     if (o.args[1] === "add") return fakeResult({ exitCode: 0 });
     return fakeResult({ exitCode: 1 });
@@ -249,18 +229,14 @@ test("AC2-d (FM-I1): multi-loopr add ok but post-add get fails -> registered-unv
 });
 
 test("FM-I8: both optional servers skipped-launcher-unavailable -> zero problems, ok true, exit_code 0, two notes", async () => {
-  const getCallCounts = new Map<string, number>();
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 1 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
     if (o.command === "py" || o.command === "python" || o.command === "python3") return fakeResult({ exitCode: 1 });
     if (o.args[1] === "get") {
-      const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
-      // Only multi-loopr is ever resolved (the two optional servers never reach a `get` call at
-      // all, since resolveServerLaunch returns "unavailable" for them first) -- pre absent, post present.
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
+      // Only multi-loopr is ever resolved (the two optional servers never reach a `get`/`add` call
+      // at all, since resolveServerLaunch returns "unavailable" for them first).
+      return fakeResult({ exitCode: 0 });
     }
     if (o.args[1] === "add") return fakeResult({ exitCode: 0 });
     return fakeResult({ exitCode: 1 });
@@ -276,19 +252,13 @@ test("FM-I8: both optional servers skipped-launcher-unavailable -> zero problems
 });
 
 test("FM-I6: an unexpected throw during one server's attempt converts to that server's own indeterminate outcome without stopping the loop", async () => {
-  const getCallCounts = new Map<string, number>();
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
-    if (o.args[1] === "get" && o.args[2] === "arxiv-mcp") {
+    if (o.args[1] === "add" && o.args[6] === "arxiv-mcp") {
       throw new Error("simulated unexpected throw");
     }
-    if (o.args[1] === "get") {
-      const name = o.args[2] as string;
-      const idx = getCallCounts.get(name) ?? 0;
-      getCallCounts.set(name, idx + 1);
-      return fakeResult({ exitCode: idx === 0 ? 1 : 0 });
-    }
+    if (o.args[1] === "get") return fakeResult({ exitCode: 0 });
     if (o.args[1] === "add") return fakeResult({ exitCode: 0 });
     return fakeResult({ exitCode: 1 });
   };
@@ -305,15 +275,21 @@ test("FM-I6: an unexpected throw during one server's attempt converts to that se
   assert.equal(paper?.outcome, "registered");
 });
 
-test("FM-I12: an already-registered server issues no add call and its detail is a verbatim stdout slice", async () => {
-  const addCalls: string[] = [];
+test("FM-I12: an already-registered server (add fails with the scope-specific 'already exists' marker) issues no post-check get, and its detail is a verbatim stderr slice", async () => {
+  // Regression test for the bug this fix addresses: `claude mcp get` cannot tell local/project
+  // scope from user scope, so the idempotency signal now comes from `claude mcp add --scope
+  // user`'s own scope-specific failure marker instead of a `get` pre-check.
+  const getCalls: string[] = [];
   const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
     if (o.command === "uvx") return fakeResult({ exitCode: 0 });
     if (o.command === "node") return fakeResult({ exitCode: 0 });
-    if (o.args[1] === "get") return fakeResult({ exitCode: 0, stdout: "Scope: User config\nType: stdio\nStatus: some-status" });
-    if (o.args[1] === "add") {
-      addCalls.push(o.args[6] as string);
+    if (o.args[1] === "get") {
+      getCalls.push(o.args[2] as string);
       return fakeResult({ exitCode: 0 });
+    }
+    if (o.args[1] === "add") {
+      const name = o.args[6] as string;
+      return fakeResult({ exitCode: 1, stderr: `MCP server ${name} already exists in user config` });
     }
     return fakeResult({ exitCode: 1 });
   };
@@ -321,14 +297,36 @@ test("FM-I12: an already-registered server issues no add call and its detail is 
     { json: false, entryPath: ENTRY_PATH },
     { runProcess, checkProviderCli: async () => ({ found: true, version: "2.1.211" }) },
   );
-  assert.equal(addCalls.length, 0);
+  assert.equal(getCalls.length, 0);
   assert.deepStrictEqual(
     report.servers.map((s) => s.outcome),
     ["already-registered", "already-registered", "already-registered"],
   );
   assert.equal(exitCode, ExitCode.OK);
   const self = report.servers.find((s) => s.id === "multi-loopr");
-  assert.ok(self?.detail.includes("Scope: User config"));
+  assert.ok(self?.detail.includes("already exists in user config"));
+});
+
+test("FM-I12-b: a genuine (non-duplicate) add failure is still 'failed', not 'already-registered' -- exit code alone cannot distinguish the two, the marker string is load-bearing", async () => {
+  const runProcess = async (o: RunProcessOptions): Promise<RawInvocationResult> => {
+    if (o.command === "uvx") return fakeResult({ exitCode: 0 });
+    if (o.command === "node") return fakeResult({ exitCode: 0 });
+    if (o.args[1] === "get") return fakeResult({ exitCode: 0 });
+    if (o.args[1] === "add") {
+      // Verified live: a malformed name / missing commandOrUrl argument also exits 1, but with
+      // stderr that does NOT contain "already exists in user config".
+      return fakeResult({ exitCode: 1, stderr: "error: missing required argument 'commandOrUrl'" });
+    }
+    return fakeResult({ exitCode: 1 });
+  };
+  const { report } = await runSetupCommand(
+    { json: false, entryPath: ENTRY_PATH },
+    { runProcess, checkProviderCli: async () => ({ found: true, version: "2.1.211" }) },
+  );
+  assert.deepStrictEqual(
+    report.servers.map((s) => s.outcome),
+    ["failed", "failed", "failed"],
+  );
 });
 
 test("renderSetupHumanReport never renders 'registered' as working/connected/ready/verified working", () => {

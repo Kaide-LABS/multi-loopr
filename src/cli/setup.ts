@@ -150,10 +150,11 @@ function optionalNote(id: SetupServerId, result: { readonly outcome: SetupOutcom
 }
 
 /**
- * Attempts to register one server: pre-check / add / verify (PHASE_9_SPEC.md §6.5), or an
- * `unavailable` short-circuit when {@link resolveServerLaunch} could not resolve a launch command.
- * Never throws -- an unexpected error is caught by the caller's per-iteration `try` and converted
- * to `indeterminate` (FM-I6).
+ * Attempts to register one server: add / verify (bugfix; formerly pre-check / add / verify per
+ * PHASE_9_SPEC.md §6.5 -- see {@link decideServerOutcome}'s doc comment for why the pre-check was
+ * removed), or an `unavailable` short-circuit when {@link resolveServerLaunch} could not resolve a
+ * launch command. Never throws -- an unexpected error is caught by the caller's per-iteration
+ * `try` and converted to `indeterminate` (FM-I6).
  */
 async function attemptServer(
   def: (typeof SETUP_SERVERS)[number],
@@ -177,43 +178,27 @@ async function attemptServer(
 
   const launch = resolution.launch;
 
-  // Step A -- pre-check.
-  const preRaw = await mcpGet(def.id, deps);
-  const pre = interpretMcpGetResult(preRaw);
-
-  if (pre === "present") {
-    const outcome = decideServerOutcome(pre, "not-attempted", "not-attempted");
-    return {
-      id: def.id,
-      required: def.required,
-      outcome,
-      launcher: launch.kind,
-      command: launch.command,
-      args: [...launch.args],
-      detail: preRaw.stdout.trim().split("\n").slice(0, 3).join("\n").slice(0, 400),
-      remediation: null,
-    };
-  }
-  if (pre === "indeterminate") {
-    const outcome = decideServerOutcome(pre, "not-attempted", "not-attempted");
-    return {
-      id: def.id,
-      required: def.required,
-      outcome,
-      launcher: launch.kind,
-      command: launch.command,
-      args: [...launch.args],
-      detail: "pre-check `claude mcp get` did not produce a conclusive answer; nothing was written",
-      remediation: null,
-    };
-  }
-
-  // pre === "absent" -- Step B.
+  // Step A -- add directly, no pre-check. `claude mcp add --scope user`'s own result (specifically
+  // whether a non-zero exit carries the "already exists in user config" marker) is the
+  // scope-specific idempotency signal; `claude mcp get` cannot supply one (no --scope flag).
   const addRaw = await mcpAdd(def.id, launch, deps);
   const add = interpretMcpAddResult(addRaw);
 
+  if (add === "already-exists") {
+    const outcome = decideServerOutcome(add, "not-attempted");
+    return {
+      id: def.id,
+      required: def.required,
+      outcome,
+      launcher: launch.kind,
+      command: launch.command,
+      args: [...launch.args],
+      detail: addRaw.stderr.trim().slice(0, 400) || "claude mcp add reported this name already exists in user config",
+      remediation: null,
+    };
+  }
   if (add === "failed") {
-    const outcome = decideServerOutcome(pre, add, "not-attempted");
+    const outcome = decideServerOutcome(add, "not-attempted");
     return {
       id: def.id,
       required: def.required,
@@ -226,7 +211,7 @@ async function attemptServer(
     };
   }
   if (add === "indeterminate") {
-    const outcome = decideServerOutcome(pre, add, "not-attempted");
+    const outcome = decideServerOutcome(add, "not-attempted");
     return {
       id: def.id,
       required: def.required,
@@ -239,10 +224,10 @@ async function attemptServer(
     };
   }
 
-  // Step C -- verify.
+  // add === "ok" -- Step B, verify.
   const postRaw = await mcpGet(def.id, deps);
   const post = interpretMcpGetResult(postRaw);
-  const outcome = decideServerOutcome(pre, add, post);
+  const outcome = decideServerOutcome(add, post);
   return {
     id: def.id,
     required: def.required,
